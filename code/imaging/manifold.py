@@ -1,0 +1,798 @@
+"""RF autofocus and piecewise surface estimation on a product manifold.
+
+The state contains positive ranges, local unit plane normals/positive offsets,
+and an anchored continuous SO(3) x R^3 correction to the supplied trajectory.
+Complex range matching follows imaging.core.MatchedResponse. Rotations are
+coherent internally; different rotations contribute separate power objectives.
+"""
+
+import time
+from functools import partial
+
+import numpy as np
+import torch
+from scipy.interpolate import BSpline
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
+from ..motion.temporal import finish_statistics, look_statistics, temporal_frames
+from ..normals.pixels import pack_normal_image
+from .backprojection import (
+    _refine_range_candidates,
+    motion_coarse_image,
+    panoradar_peak_surface,
+)
+from .core import C, backend, radar_pixel_rays
+from .selection import select_motion_surface
+
+
+def _tensor(value, device):
+    # DLPack also supports the installed Torch 2 / NumPy 2 combination.
+    array = np.ascontiguousarray(value)
+    boolean = array.dtype == bool
+    if boolean:
+        array = array.astype(np.uint8)
+    result = torch.from_dlpack(array).to(device)
+    return result.bool() if boolean else result
+
+
+def _array(value):
+    if value.dtype == torch.bool:
+        return np.from_dlpack(value.detach().to(torch.uint8).cpu()).astype(bool)
+    return np.from_dlpack(value.detach().cpu()).copy()
+
+
+def _rotation(vector):
+    """Rodrigues exponential with finite derivatives at zero."""
+    x, y, z = vector.unbind(-1)
+    zero = torch.zeros_like(x)
+    skew = torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), -1)
+    skew = skew.reshape(*vector.shape[:-1], 3, 3)
+    theta = torch.sqrt(vector.square().sum(-1) + 1e-20)
+    a = torch.sinc(theta / torch.pi)[..., None, None]
+    b = (0.5 * torch.sinc(theta / (2 * torch.pi)).square())[..., None, None]
+    return (
+        torch.eye(3, dtype=vector.dtype, device=vector.device)
+        + a * skew
+        + b * (skew @ skew)
+    )
+
+
+def _patches(ranges, rays, supported, shape):
+    """Local connected patches; depth discontinuities split a chart."""
+    h, w = ranges.shape
+    rows, cols = np.indices((h, w))
+    block = (rows // shape[0]) * int(np.ceil(w / shape[1])) + cols // shape[1]
+    nodes = np.arange(h * w).reshape(h, w)
+    u = np.r_[nodes[:, :-1].ravel(), nodes[:-1].ravel()]
+    v = np.r_[nodes[:, 1:].ravel(), nodes[1:].ravel()]
+    ray = rays.reshape(-1, 3)
+    depth = ranges.ravel()
+    separation = np.linalg.norm(ray[u] - ray[v], axis=-1)
+    connect = (
+        (block.ravel()[u] == block.ravel()[v])
+        & (
+            np.abs(depth[u] - depth[v])
+            < 0.15 + 2 * separation * np.minimum(depth[u], depth[v])
+        )
+        & supported.ravel()[u]
+        & supported.ravel()[v]
+    )
+    graph = coo_matrix(
+        (np.ones(connect.sum()), (u[connect], v[connect])), shape=(h * w, h * w)
+    ).tocsr()
+    count, labels = connected_components(graph, directed=False)
+    points = depth[:, None] * ray
+    size = np.bincount(labels, minlength=count)
+    centers = (
+        np.stack(
+            [
+                np.bincount(labels, weights=points[:, j], minlength=count)
+                for j in range(3)
+            ],
+            -1,
+        )
+        / size[:, None]
+    )
+    delta = points - centers[labels]
+    covariance = (
+        np.stack(
+            [
+                np.bincount(labels, weights=delta[:, j] * delta[:, k], minlength=count)
+                for j in range(3)
+                for k in range(3)
+            ],
+            -1,
+        ).reshape(count, 3, 3)
+        / size[:, None, None]
+    )
+    values, vectors = np.linalg.eigh(covariance)
+    normals = vectors[:, :, 0]
+    frontal = centers / np.maximum(
+        np.linalg.norm(centers, axis=-1, keepdims=True), 1e-12
+    )
+    normals *= np.where((normals * frontal).sum(-1) < 0, -1, 1)[:, None]
+    degenerate = (
+        (size < 6) | (values[:, 1] < 1e-8) | ((normals * centers).sum(-1) < 0.02)
+    )
+    normals[degenerate] = frontal[degenerate]
+    offsets = (normals * centers).sum(-1)
+    axis = np.tile([0.0, 0.0, 1.0], (count, 1))
+    axis[np.abs(normals[:, 2]) > 0.9] = [0.0, 1.0, 0.0]
+    tangent = np.cross(normals, axis)
+    tangent /= np.linalg.norm(tangent, axis=-1, keepdims=True)
+    basis = np.stack((tangent, np.cross(normals, tangent)), -1)
+    return labels, normals, offsets, basis
+
+
+class _Scene(torch.nn.Module):
+    def __init__(self, initial, supported, args, basis_count, device):
+        super().__init__()
+        rays = radar_pixel_rays()[:, :-1]
+        ranges = np.linalg.norm(initial[:, :-1], axis=-1)
+        labels, normals, offsets, tangent = _patches(
+            ranges, rays, supported[:, :-1], args.patch_shape
+        )
+        self.rays = _tensor(rays.reshape(-1, 3), device)
+        self.initial_range = _tensor(ranges.ravel(), device)
+        self.supported = _tensor(supported[:, :-1].ravel(), device)
+        self.labels = _tensor(labels, device)
+        self.normals = _tensor(normals, device)
+        self.offsets = _tensor(offsets, device)
+        self.tangent = _tensor(tangent, device)
+        self.range_scale = torch.minimum(
+            torch.log1p(args.range_bound_m / self.initial_range),
+            torch.minimum(
+                torch.log(self.initial_range / args.min_range).clamp_min(0),
+                torch.log(args.max_range / self.initial_range).clamp_min(0),
+            ),
+        )
+        self.offset_scale = torch.log1p(args.range_bound_m / self.offsets)
+        self.range_chart = torch.nn.Parameter(torch.zeros_like(self.initial_range))
+        self.normal_chart = torch.nn.Parameter(
+            torch.zeros((len(normals), 2), device=device, dtype=torch.float64)
+        )
+        self.offset_chart = torch.nn.Parameter(torch.zeros_like(self.offsets))
+        self.pose_chart = torch.nn.Parameter(
+            torch.zeros((basis_count, 6), device=device, dtype=torch.float64),
+            requires_grad=args.platform_motion == "moving",
+        )
+        self.pose_scale = _tensor(
+            np.r_[
+                np.full(3, args.translation_bound_m),
+                np.full(3, np.deg2rad(args.rotation_bound_deg)),
+            ],
+            device,
+        )
+        self.args = args
+
+    def ranges(self):
+        return self.initial_range * torch.exp(
+            self.range_scale * torch.tanh(self.range_chart)
+        )
+
+    def points(self):
+        return self.ranges()[:, None] * self.rays
+
+    def planes(self):
+        delta = 0.35 * torch.tanh(self.normal_chart)
+        normal = self.normals + torch.einsum("nij,nj->ni", self.tangent, delta)
+        normal = normal / torch.linalg.vector_norm(normal, dim=-1, keepdim=True)
+        offset = self.offsets * torch.exp(
+            self.offset_scale * torch.tanh(self.offset_chart)
+        )
+        return normal, offset
+
+    def correction(self, basis):
+        return basis @ (torch.tanh(self.pose_chart) * self.pose_scale)
+
+    def regularizer(self):
+        normal, offset = self.planes()
+        residual = (
+            (normal[self.labels] * self.points()).sum(-1) - offset[self.labels]
+        ) / 0.05
+        weight = self.supported.to(residual.dtype)
+        plane = (
+            (torch.sqrt(1 + residual.square()) - 1) * weight
+        ).sum() / weight.sum().clamp_min(1)
+        range_prior = torch.tanh(self.range_chart).square().mean()
+        controls = torch.tanh(self.pose_chart)
+        pose_prior = controls.square().mean()
+        smooth = (controls[2:] - 2 * controls[1:-1] + controls[:-2]).square().mean()
+        chart_prior = (
+            torch.tanh(self.normal_chart).square().mean()
+            + torch.tanh(self.offset_chart).square().mean()
+        )
+        total = (
+            self.args.geometry_weight * plane
+            + self.args.range_prior_weight * range_prior
+            + self.args.pose_prior_weight * (pose_prior + smooth)
+            + 0.001 * chart_prior
+        )
+        return total, plane
+
+
+class _Look:
+    def __init__(self, trajectory, number, target, args, device, include_padding=False):
+        frame, geometry, facing, origins, record = trajectory.registered_frame(
+            number, target, args.aperture, args.geometry_json
+        )
+        start, end = trajectory.core_bounds(number)
+        raw_lo = record["registered_raw_indices"][0]
+        if include_padding:
+            start, end = record["registered_raw_indices"]
+        take = slice(start - raw_lo, end - raw_lo)
+        frame = frame[take]
+        self.wave = trajectory.waveform
+        self.positions = _tensor(geometry.phase_centers_m[take], device)
+        self.tx = (
+            None if geometry.tx_m is None else _tensor(geometry.tx_m[take], device)
+        )
+        self.rx = (
+            None if geometry.rx_m is None else _tensor(geometry.rx_m[take], device)
+        )
+        self.facing = _tensor(facing[take], device)
+        self.origins = _tensor(origins[take], device)
+        self.timestamps = trajectory.timestamps[start:end]
+        self.number = number
+        self.record = dict(record, registered_raw_indices=[start, end])
+        self.nfft = frame.shape[-1] * args.oversample
+        window = torch.hann_window(frame.shape[-1], periodic=False, device=device)
+        signal = _tensor(frame, device)
+        self.spectrum = (
+            torch.fft.fft(signal * window, n=self.nfft, dim=-1) / window.sum()
+        )
+        self.device = device
+        self.xp = backend(args.backend)
+        self.indices, self.mask = [], []
+
+    @torch.no_grad()
+    def select_aperture(self, points, origins, facing, count):
+        point = _tensor(points, self.device)
+        ray = point[:, None] - self.origins[None]
+        cosine = (ray * self.facing).sum(-1) / torch.linalg.vector_norm(
+            ray, dim=-1
+        ).clamp_min(1e-12)
+        ids = torch.topk(cosine, count, dim=-1).indices.sort(-1).values
+        return _array(ids), _array(cosine.gather(1, ids) >= np.cos(np.pi / 4))
+
+    @torch.no_grad()
+    def apertures(self, points, count, batch_size):
+        for start in range(0, len(points), batch_size):
+            ray = points[start : start + batch_size, None] - self.origins[None]
+            cosine = (ray * self.facing).sum(-1) / torch.linalg.vector_norm(
+                ray, dim=-1
+            ).clamp_min(1e-12)
+            ids = torch.topk(cosine, count, dim=-1).indices.sort(-1).values
+            self.indices.append(ids)
+            self.mask.append(cosine.gather(1, ids) >= np.cos(np.pi / 4))
+        self.indices = torch.cat(self.indices)
+        self.mask = torch.cat(self.mask)
+
+    def geometry(self, scene):
+        delta = scene.correction(self.basis)
+        rotation = _rotation(delta[:, 3:])
+
+        def transform(points):
+            return torch.einsum("nij,ncj->nci", rotation, points) + delta[:, None, :3]
+
+        positions = transform(self.positions)
+        return (
+            positions,
+            None if self.tx is None else transform(self.tx),
+            None if self.rx is None else transform(self.rx),
+        )
+
+    def response(self, scene, selected, split=None):
+        ids, mask = self.indices[selected], self.mask[selected]
+        if split is not None:
+            ids, mask = ids[:, split::2], mask[:, split::2]
+        positions, tx, rx = self.geometry(scene)
+        return self.sample(scene.points()[selected], ids, mask, positions, tx, rx)
+
+    def sample(self, points, ids, mask, positions, tx, rx):
+        point = points[:, None, None]
+        if tx is None:
+            path = 2 * torch.linalg.vector_norm(positions[ids] - point, dim=-1)
+        else:
+            path = torch.linalg.vector_norm(
+                tx[ids] - point, dim=-1
+            ) + torch.linalg.vector_norm(rx[ids] - point, dim=-1)
+        radius = torch.linalg.vector_norm(point[:, 0, 0], dim=-1)[:, None, None]
+        delta = path - 2 * radius
+        frequency = (
+            2 * radius * self.wave.range_step_hz + delta * self.wave.spatial_step_hz
+        ) / C
+        valid = (frequency >= 0) & (frequency < 1 - 1 / self.nfft) & mask[..., None]
+        coordinate = (frequency * self.nfft).clamp(0, self.nfft - 1.000001)
+        lower = coordinate.to(torch.int64)
+        fraction = coordinate - lower
+        channels = torch.arange(8, device=self.device)[None, None]
+        a = self.spectrum[ids[..., None], channels, lower]
+        b = self.spectrum[ids[..., None], channels, lower + 1]
+        phase = (-2 * np.pi * self.wave.start_hz / C * delta).to(torch.float32)
+        response = (a * (1 - fraction) + b * fraction) * torch.polar(
+            torch.ones_like(phase), phase
+        )
+        return torch.where(valid, response, 0), mask.sum(-1) * 8
+
+    @torch.no_grad()
+    def contributions(self, points, indices):
+        ids = _tensor(indices, self.device)
+        response, _ = self.sample(
+            _tensor(points, self.device),
+            ids,
+            torch.ones_like(ids, dtype=torch.bool),
+            self.positions,
+            self.tx,
+            self.rx,
+        )
+        value = _array(response) if self.xp is np else self.xp.from_dlpack(response)
+        return value, None
+
+    def power(self, scene, selected, split=None):
+        response, count = self.response(scene, selected, split)
+        return (response.sum((1, 2)).abs() / count.clamp_min(1)).square()
+
+
+@torch.no_grad()
+def _measure(scene, looks, batch_size):
+    power, coherence, beta, training, acceptance = [], [], [], [], []
+    for look in looks:
+        p, c, b, train, accept = [], [], [], [], []
+        for start in range(0, len(scene.rays), batch_size):
+            ids = torch.arange(
+                start,
+                min(start + batch_size, len(scene.rays)),
+                device=scene.rays.device,
+            )
+            response, count = look.response(scene, ids)
+            summed = response.sum((1, 2))
+            p.append((summed.abs() / count.clamp_min(1)).square())
+            c.append(summed.abs() / response.abs().sum((1, 2)).clamp_min(1e-20))
+            b.append(summed / count.clamp_min(1))
+            for split, collection in ((0, train), (1, accept)):
+                split_count = look.mask[ids, split::2].sum(-1) * 8
+                collection.append(
+                    (
+                        response[:, split::2].sum((1, 2)).abs()
+                        / split_count.clamp_min(1)
+                    ).square()
+                )
+        power.append(torch.cat(p))
+        coherence.append(torch.cat(c))
+        beta.append(torch.cat(b))
+        training.append(torch.cat(train))
+        acceptance.append(torch.cat(accept))
+    return tuple(
+        torch.stack(values) for values in (power, coherence, beta, training, acceptance)
+    )
+
+
+@torch.no_grad()
+def _final_normals(scene, looks, points, args):
+    """Vote at finalized points with the exact same corrected matching geometry."""
+    count = len(scene.rays)
+    targets = scene.points()
+    stats = {}
+    for look in looks:
+        positions, tx, rx = look.geometry(scene)
+        for start in range(0, count, args.batch_size):
+            selected = torch.arange(
+                start, min(start + args.batch_size, count), device=scene.rays.device
+            )
+            ids, mask = look.indices[selected], look.mask[selected]
+            target = targets[selected]
+            response, _ = look.sample(target, ids, mask, positions, tx, rx)
+            if tx is None:
+                ray = positions[ids] - target[:, None, None]
+                directions = ray / torch.linalg.vector_norm(
+                    ray, dim=-1, keepdim=True
+                ).clamp_min(1e-12)
+            else:
+                a, b = tx[ids] - target[:, None, None], rx[ids] - target[:, None, None]
+                directions = a / torch.linalg.vector_norm(
+                    a, dim=-1, keepdim=True
+                ).clamp_min(1e-12) + b / torch.linalg.vector_norm(
+                    b, dim=-1, keepdim=True
+                ).clamp_min(1e-12)
+                directions /= torch.linalg.vector_norm(
+                    directions, dim=-1, keepdim=True
+                ).clamp_min(1e-12)
+            if args.temporal_fusion == "coherent":
+                values = {
+                    "complex_sum": response.sum(dim=(1, 2)),
+                    "complex_direction": (response[..., None] * directions).sum(
+                        dim=(1, 2)
+                    ),
+                    "absolute_sum": response.abs().sum(dim=(1, 2)),
+                }
+            else:
+                values = look_statistics(response, directions, torch)
+            for key, value in values.items():
+                value = _array(value)
+                if key not in stats:
+                    stats[key] = np.zeros(
+                        (count, *value.shape[1:]),
+                        dtype=value.dtype if np.iscomplexobj(value) else np.float64,
+                    )
+                stats[key][start : start + len(selected)] += value
+    if args.temporal_fusion == "coherent":
+        samples = len(looks) * args.aperture * 8
+        summed = stats["complex_sum"]
+        stats = {
+            "vector": np.real(stats["complex_direction"] * summed.conj()[:, None])
+            / samples**2,
+            "power": np.abs(summed / samples) ** 2,
+            "absolute_bound": (stats["absolute_sum"] / samples) ** 2,
+        }
+    estimated = finish_statistics(
+        stats,
+        1 if args.temporal_fusion == "coherent" else len(looks),
+        args.min_coherence,
+        args.dynamic_range_db,
+    )
+    index = np.arange(count).reshape(64, 511)
+    inverse = np.concatenate((index, index[:, :1]), axis=1).ravel()
+    field = pack_normal_image(estimated, inverse, points)
+    return {
+        "pred_rhs": field["pred_rhs"],
+        "normal_comparison": field["normal_comparison"].astype(np.float32),
+        "normal_defined": field["defined"],
+        "normal_valid": field["valid"],
+        "normal_reflection": field["reflection"].astype(np.float32),
+        "normal_coherence": field["coherence"].astype(np.float32),
+    }
+
+
+def reconstruct(args, trajectory):
+    """Finalize one RF-only scene; never load labels, images or LiDAR poses."""
+    started = time.monotonic()
+    frames = temporal_frames(
+        args.frame_num, trajectory.frame_count, args.temporal_window
+    )
+    if args.temporal_fusion == "coherent" and trajectory.estimated_poses:
+        raise ValueError(
+            "Coherent normal fusion requires calibrated external poses and stable inter-rotation phase"
+        )
+    record = trajectory.frame_metadata(args.frame_num)
+    if args.aperture > min(
+        trajectory.core_bounds(i)[1] - trajectory.core_bounds(i)[0] for i in frames
+    ):
+        raise ValueError("Aperture exceeds a contributing radar rotation")
+    image = partial(
+        motion_coarse_image,
+        range_oversample=args.coarse_oversample,
+        waveform=trajectory.waveform,
+    )
+    xp = backend(args.backend)
+    device = torch.device("cpu" if xp is np else "cuda")
+    stages = {}
+    stage_started = time.monotonic()
+    print("  Reading RF and preparing target geometry", flush=True)
+    frame, geometry, facing, origins, _ = trajectory.registered_frame(
+        args.frame_num, args.frame_num, args.aperture, args.geometry_json
+    )
+    stages["target_read_preprocess_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    coarse = image(frame, geometry, origins, facing, args.aperture, args.backend)
+    baseline = panoradar_peak_surface(
+        coarse, args.coarse_oversample, args.min_range, args.max_range
+    )
+    stages["target_coarse_image_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    print("  Selecting RF surface initialization", flush=True)
+    if xp is not np:
+        xp.get_default_memory_pool().free_all_blocks()
+    refinement_look = _Look(
+        trajectory, args.frame_num, args.frame_num, args, device, include_padding=True
+    )
+    refine = partial(
+        _refine_range_candidates,
+        args,
+        frame=frame,
+        geometry=geometry,
+        origins=origins,
+        facing=facing,
+        upper=min(
+            args.max_range,
+            C
+            / (2 * refinement_look.wave.bandwidth_hz)
+            * (refinement_look.wave.samples - 1 / args.oversample),
+        ),
+        sampler=refinement_look,
+        aperture_selector=refinement_look.select_aperture,
+    )
+    initial, fields, initialization = select_motion_surface(
+        args, trajectory, args.frame_num, frames, coarse, image, refine
+    )
+    stages["multiview_surface_initialization_seconds"] = (
+        time.monotonic() - stage_started
+    )
+    stage_started = time.monotonic()
+    del coarse, frame, refine, refinement_look
+    if xp is not np:
+        xp.get_default_memory_pool().free_all_blocks()
+    looks = [
+        _Look(trajectory, number, args.frame_num, args, device) for number in frames
+    ]
+    first, last = (
+        min(x.timestamps[0] for x in looks),
+        max(x.timestamps[-1] for x in looks),
+    )
+    if (last - first) / args.pose_knot_spacing_s > 256:
+        raise ValueError(
+            "Trajectory correction exceeds 256 spline intervals; increase pose_knot_spacing_s"
+        )
+    internal = np.arange(
+        args.pose_knot_spacing_s, last - first, args.pose_knot_spacing_s
+    )
+    knots = np.r_[np.zeros(4), internal, np.full(4, last - first)]
+    spline = BSpline(knots, np.eye(len(knots) - 4), 3, extrapolate=False)
+    anchor_time = trajectory.timestamps[int(trajectory.separators[args.frame_num])]
+    anchor_basis = spline(anchor_time - first)
+    scene = _Scene(initial, fields["surface_valid"], args, len(knots) - 4, device)
+    for look in looks:
+        # Center and scale the basis to fix the reference pose and bound each
+        # correction component by its configured coefficient scale.
+        look.basis = _tensor(
+            0.5 * (spline(look.timestamps - first) - anchor_basis), device
+        )
+        look.apertures(scene.points().detach(), args.aperture, args.batch_size)
+    stages["manifold_and_spectra_setup_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    initial_power, initial_coherence, _, training_power, acceptance_power = _measure(
+        scene, looks, args.batch_size
+    )
+    stages["initial_dense_matching_seconds"] = time.monotonic() - stage_started
+    noise = initial_power.median(dim=1).values.clamp_min(1e-20) * 0.01
+    supported = torch.nonzero(scene.supported, as_tuple=False).flatten()
+    if len(supported) < 16 or initial_power.max().item() <= 1e-20:
+        raise ValueError("Insufficient RF-supported surface for joint optimization")
+    random = np.random.default_rng(args.seed)
+    validation = supported[
+        _tensor(
+            random.choice(len(supported), min(2048, len(supported)), replace=False),
+            device,
+        )
+    ]
+    reference = acceptance_power[:, validation]
+
+    def rf_objective(ids, split, normalizer):
+        power = torch.stack([look.power(scene, ids, split) for look in looks])
+        ratio = (power + noise[:, None]) / (normalizer + noise[:, None])
+        return -torch.log(ratio.clamp_min(1e-12)).mean()
+
+    def objective(ids, split, normalizer):
+        rf = rf_objective(ids, split, normalizer)
+        regularizer, plane = scene.regularizer()
+        return rf + regularizer, rf, plane
+
+    with torch.no_grad():
+        value, rf, plane = objective(validation, 1, reference)
+    initial_objective = value.item()
+    best_value = initial_objective
+    best_iteration = 0
+    best = {key: value.detach().clone() for key, value in scene.state_dict().items()}
+    history = [
+        {
+            "iteration": 0,
+            "objective": best_value,
+            "rf_loss": rf.item(),
+            "plane_loss": plane.item(),
+        }
+    ]
+    optimizer = torch.optim.Adam(scene.parameters(), lr=args.learning_rate)
+    initialization_seconds = time.monotonic() - started
+    stage_started = time.monotonic()
+    for step in range(args.iterations):
+        optimizer.zero_grad()
+        training_rf = torch.zeros((), dtype=torch.float64, device=device)
+        # Accumulate the full surface mean, including a short final batch,
+        # before updating shared trajectory and per-point surface parameters.
+        for start in range(0, len(supported), args.batch_size):
+            ids = supported[start : start + args.batch_size]
+            rf = rf_objective(ids, 0, training_power[:, ids])
+            weighted = rf * (len(ids) / len(supported))
+            weighted.backward()
+            training_rf += weighted.detach()
+        regularizer, _ = scene.regularizer()
+        if not torch.isfinite(training_rf + regularizer):
+            raise RuntimeError("Nonfinite RF/manifold objective")
+        regularizer.backward()
+        torch.nn.utils.clip_grad_norm_(scene.parameters(), 10)
+        optimizer.step()
+        if (step + 1) % 10 == 0 or step + 1 == args.iterations:
+            with torch.no_grad():
+                value, rf, plane = objective(validation, 1, reference)
+            if not torch.isfinite(value):
+                raise RuntimeError("Nonfinite RF acceptance objective")
+            history.append(
+                {
+                    "iteration": step + 1,
+                    "objective": value.item(),
+                    "rf_loss": rf.item(),
+                    "plane_loss": plane.item(),
+                    "training_rf_loss_before_update": training_rf.item(),
+                }
+            )
+            if (
+                np.isfinite(value.item())
+                and value.item() < best_value
+                and rf.item() <= 0
+            ):
+                best_value = value.item()
+                best_iteration = step + 1
+                best = {
+                    key: value.detach().clone()
+                    for key, value in scene.state_dict().items()
+                }
+            print(
+                f"  optimization {step + 1}/{args.iterations}: RF acceptance loss={rf.item():.5f}",
+                flush=True,
+            )
+    scene.load_state_dict(best)
+    stages["optimization_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    power, coherence, reflectivity, _, _ = _measure(scene, looks, args.batch_size)
+    dense_gain = (
+        torch.log(
+            (power[:, supported] + noise[:, None])
+            / (initial_power[:, supported] + noise[:, None])
+        )
+        .mean()
+        .item()
+    )
+    accepted = best_value < initial_objective and dense_gain >= 0
+    if not accepted:
+        scene.load_state_dict(
+            {key: torch.zeros_like(value) for key, value in best.items()}
+        )
+        power, coherence, reflectivity, _, _ = _measure(scene, looks, args.batch_size)
+    stages["final_dense_matching_seconds"] = time.monotonic() - stage_started
+    selected_passes = best_iteration if accepted else 0
+    points = _array(scene.points()).reshape(64, 511, 3)
+
+    def panorama(value):
+        return np.concatenate((value, value[:, :1]), axis=1)
+
+    anchor = trajectory.poses.at([anchor_time])[0]
+    points = panorama(points)
+    normal_started = time.monotonic()
+    normal_fields = _final_normals(scene, looks, points, args)
+    normal_fields["normal_valid"] &= fields["surface_valid"]
+    stages["final_echo_normals_seconds"] = time.monotonic() - normal_started
+    times = np.concatenate([look.timestamps for look in looks])
+    bases = _tensor(0.5 * (spline(times - first) - anchor_basis), device)
+    with torch.no_grad():
+        correction = scene.correction(bases)
+        rotation = _array(_rotation(correction[:, 3:]))
+        correction_array = _array(correction)
+        plane_normals, plane_offsets = scene.planes()
+    prior = np.linalg.inv(anchor)[None] @ trajectory.poses.at(times)
+    delta = np.broadcast_to(np.eye(4), prior.shape).copy()
+    delta[:, :3, :3] = rotation
+    delta[:, :3, 3] = correction_array[:, :3]
+    corrected = delta @ prior
+    result = {
+        **baseline,
+        **normal_fields,
+        "points_m": points.astype(np.float32),
+        "world_points_m": (points @ anchor[:3, :3].T + anchor[:3, 3]).astype(
+            np.float32
+        ),
+        "predicted_range_m": np.linalg.norm(points, axis=-1).astype(np.float32),
+        "initial_points_m": initial.astype(np.float32),
+        "initial_range_m": np.linalg.norm(initial, axis=-1).astype(np.float32),
+        "surface_valid": fields["surface_valid"],
+        "rf_update_count": panorama(
+            _array(scene.supported).reshape(64, 511).astype(np.int32) * selected_passes
+        ),
+        "patch_ids": panorama(_array(scene.labels).reshape(64, 511)),
+        "geometric_patch_normals": _array(plane_normals),
+        "geometric_patch_offsets_m": _array(plane_offsets),
+        "initial_reflection": panorama(
+            _array(initial_power.mean(0).sqrt()).reshape(64, 511)
+        ).astype(np.float32),
+        "reflection": panorama(_array(power.mean(0).sqrt()).reshape(64, 511)).astype(
+            np.float32
+        ),
+        "initial_coherence": panorama(
+            _array(initial_coherence.mean(0)).reshape(64, 511)
+        ).astype(np.float32),
+        "coherence": panorama(_array(coherence.mean(0)).reshape(64, 511)).astype(
+            np.float32
+        ),
+        "complex_reflectivity": np.stack(
+            [panorama(x.reshape(64, 511)) for x in _array(reflectivity)]
+        ),
+        "pose_timestamps_s": times,
+        "world_from_platform": anchor[None] @ corrected,
+        "initial_world_from_platform": anchor[None] @ prior,
+    }
+    for name, value in result.items():
+        if not np.isfinite(value).all():
+            raise FloatingPointError(f"Nonfinite finalized scene field: {name}")
+    report = dict(
+        record,
+        prediction_uses_lidar=False,
+        single_reconstruction=True,
+        normal_estimation="signed RF echo votes at the finalized surface and the same corrected per-chirp geometry; no range gradients",
+        normal_fusion=args.temporal_fusion,
+        panoradar_baseline={
+            "method": "PanoRadar Eq. 11 beamforming; native range FFT peak per direction as Figure 9; no neural network",
+            "source_frames": [args.frame_num],
+            "aperture": args.aperture,
+            "native_range_bins": trajectory.waveform.samples,
+            "range_refinement": False,
+            "surface_graph": False,
+            "scope": "independent local equation implementation using the target RF circle and the supplied prior geometry; not the learned model or CFAR extraction",
+        },
+        initialization=initialization,
+        source_frames=frames,
+        sample_intervals=[look.record["registered_raw_indices"] for look in looks],
+        pose_source=trajectory.poses.source,
+        backend=str(device),
+        device_name=torch.cuda.get_device_name(device)
+        if device.type == "cuda"
+        else "CPU",
+        torch_version=torch.__version__,
+        numpy_version=np.__version__,
+        state_space="positive radial surface field; local S2 x R+ planes; anchored continuous SO(3) x R3 trajectory correction",
+        phase_model="coherent within each disjoint rotation; separate powers and complex reflectivities across rotations",
+        objective="log matched-power ratio with RF-only acceptance and robust local plane/range/trajectory priors",
+        optimization_accepted=accepted,
+        optimization_coverage={
+            "sampling": "full supported surface per Adam step; batch-weighted RF gradient accumulation",
+            "supported_surface_points": len(supported),
+            "attempted_full_passes": args.iterations,
+            "attempted_point_updates": args.iterations * len(supported),
+            "selected_full_passes": selected_passes,
+            "finalized_covered_fraction": 1.0 if selected_passes else 0.0,
+            "acceptance_uses_lidar": False,
+        },
+        rf_acceptance_objective_initial=initial_objective,
+        rf_acceptance_objective_best=best_value,
+        dense_log_power_gain_before_acceptance=dense_gain,
+        initialization_seconds=initialization_seconds,
+        prediction_seconds=time.monotonic() - started,
+        stages=stages,
+        surface_support_reference="RF initialization; never used to exclude primary evaluation pixels",
+        maximum_translation_correction_m=float(
+            np.linalg.norm(correction_array[:, :3], axis=-1).max()
+        ),
+        maximum_rotation_correction_deg=float(
+            np.rad2deg(np.linalg.norm(correction_array[:, 3:], axis=-1).max())
+        ),
+        initial_mean_coherence=float(initial_coherence[:, supported].mean().item()),
+        final_mean_coherence=float(coherence[:, supported].mean().item()),
+        range_correction={
+            "mean_absolute_m": float(
+                np.abs(
+                    result["predicted_range_m"][:, :-1]
+                    - result["initial_range_m"][:, :-1]
+                ).mean()
+            ),
+            "maximum_absolute_m": float(
+                np.abs(
+                    result["predicted_range_m"][:, :-1]
+                    - result["initial_range_m"][:, :-1]
+                ).max()
+            ),
+            "supported_fraction_near_chart_bound": float(
+                (torch.tanh(scene.range_chart[supported]).abs() >= 0.95)
+                .to(torch.float64)
+                .mean()
+                .item()
+            ),
+        },
+        optimization_history=history,
+        limitations=[
+            "Local single-surface radial charts initialized from RF peaks; no guarantee of global optimum or recovery outside those branches",
+            "Effective PanoRadar array unless calibrated Tx/Rx geometry is supplied; nominal motor angles remain fixed",
+            "Small bounded trajectory corrections; weakly observed six-axis motion is regularized, not independently measured",
+            "Matched-power autofocus is not a full multiple-scatterer or multipath forward inversion",
+            "RF acceptance chirps are excluded from gradient updates, but initialization uses all chirps",
+        ],
+    )
+    return result, report

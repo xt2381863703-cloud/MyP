@@ -1,0 +1,10 @@
+# Independent code runtime.
+numpy
+scipy
+matplotlib
+PyYAML
+opencv-python
+torch==2.0.0
+torchvision==0.15.1
+# Used by code.visualize_lidar; CUDA imaging additionally needs matching CuPy.
+plotly
