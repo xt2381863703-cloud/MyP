@@ -19,8 +19,8 @@ from ..config.data import (
 from ..config.evaluation import validate_evaluation_settings
 from ..config.paths import CODE_ROOT, CONFIG_ROOT, PROJECT_ROOT
 from ..config.settings import DEFAULTS
-from ..data.formats import dataset_root, rf_input_paths
-from ..data.trajectory import prepare_output_folder
+from ..dataset_io.formats import dataset_root, rf_input_paths
+from ..dataset_io.trajectory import prepare_output_folder
 
 
 def _settings(argv):
@@ -30,7 +30,6 @@ def _settings(argv):
     for key in (
         "in_traj_folder",
         "out_folder",
-        "motion_poses",
         "geometry_json",
         "processed_traj_folder",
     ):
@@ -115,9 +114,6 @@ def _settings(argv):
             raise ValueError("surface_refine_steps must be odd and >=3")
         for key in (
             "learning_rate",
-            "pose_knot_spacing_s",
-            "translation_bound_m",
-            "rotation_bound_deg",
             "range_bound_m",
             "surface_refine_radius_m",
             "min_range",
@@ -125,7 +121,6 @@ def _settings(argv):
             "surface_support_db",
             "geometry_weight",
             "range_prior_weight",
-            "pose_prior_weight",
         ):
             value = settings[key]
             if (
@@ -179,7 +174,6 @@ def _settings(argv):
         for key in (
             "in_traj_folder",
             "out_folder",
-            "motion_poses",
             "geometry_json",
             "processed_traj_folder",
         ):
@@ -187,11 +181,6 @@ def _settings(argv):
                 settings[key] = Path(settings[key]).expanduser().resolve()
         if root not in settings["in_traj_folder"].parents:
             raise ValueError(f"Input trajectory must be under {root}")
-        if (
-            settings["platform_motion"] == "static"
-            and settings["motion_poses"] is not None
-        ):
-            raise ValueError("Static platform must not specify motion_poses")
     except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
         parser.error(str(exc))
     return SimpleNamespace(**settings), cli
@@ -206,7 +195,7 @@ def _json(path, value):
     temporary.replace(path)
 
 
-def _fingerprint(args):
+def _fingerprint(args, input_paths):
     digest = hashlib.sha256()
     for name in (
         "imaging/scene.py",
@@ -217,10 +206,10 @@ def _fingerprint(args):
         "motion/temporal.py",
         "imaging/selection.py",
         "imaging/core.py",
-        "data/trajectory.py",
-        "data/pano_data.py",
-        "data/self_data.py",
-        "data/formats.py",
+        "dataset_io/trajectory.py",
+        "dataset_io/pano_data.py",
+        "dataset_io/self_data.py",
+        "dataset_io/formats.py",
         "config/settings.py",
         "config/data.py",
         "config/paths.py",
@@ -234,7 +223,7 @@ def _fingerprint(args):
         "visualization/comparison.py",
     ):
         digest.update((CODE_ROOT / name).read_bytes())
-    for path in rf_input_paths(args):
+    for path in input_paths:
         stat = path.stat()
         digest.update(f"{path}:{stat.st_size}:{stat.st_mtime_ns}".encode())
     digest.update(json.dumps(vars(args), sort_keys=True, default=str).encode())
@@ -266,7 +255,12 @@ def _evaluate_and_plot(args, cli, prediction, paths, report):
     from ..evaluation.reference import create_reference
 
     reference, unmasked, metadata = create_reference(args).load_pair(args.frame_num)
-    evaluation, errors = compare(prediction, reference, args)
+    evaluation, errors = compare(
+        prediction,
+        reference,
+        args,
+        pose_refinement_enabled=report.get("pose_refinement_enabled", True),
+    )
     evaluation["reference"] = metadata
     if paths["evaluation"].exists():
         saved = json.loads(paths["evaluation"].read_text(encoding="utf-8"))
@@ -387,6 +381,7 @@ def main(argv=None):
         }
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         return result
+    input_paths = rf_input_paths(args)
     from ..motion.trajectory import MotionTrajectory
     from .manifold import reconstruct
 
@@ -408,15 +403,14 @@ def main(argv=None):
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    fingerprint = _fingerprint(args)
+    fingerprint = _fingerprint(args, input_paths)
     trajectory = MotionTrajectory(
         args.in_traj_folder,
-        not args.keep_background,
-        args.motion_poses,
-        args.platform_motion,
-        args.dataset_type,
+        subtract_background=not args.keep_background,
+        platform_motion=args.platform_motion,
+        dataset_type=args.dataset_type,
     )
-    print(f"统一重建第 {args.frame_num} 圈：表面、校正轨迹与回波法线", flush=True)
+    print(f"统一重建第 {args.frame_num} 圈：表面、轨迹与回波法线", flush=True)
     prediction, report = reconstruct(args, trajectory)
     np.savez_compressed(paths["prediction"], **prediction)
     points = prediction["points_m"][:, :-1].reshape(-1, 3)

@@ -6,7 +6,7 @@
 python -m code.image_scene
 ```
 
-一次重建输出同一套最终表面、逐 chirp 校正轨迹和 RF 回波法线，默认生成三幅中文
+一次重建输出同一套最终表面、逐 chirp 轨迹和 RF 回波法线，默认生成三幅中文
 对比图。原法线、水平轮廓的独立入口及配置已移除，运行时不再重复执行不同的表面
 选择流程。`paper/`、`pano/` 不参与运行或源码指纹；无神经网络训练或权重加载。
 
@@ -52,10 +52,10 @@ python -m code.image_scene --no-plot
 没有原方法基线与回波法线的 NPZ 无法生成新的三幅图，需用统一入口重新计算。
 `--evaluate-only` 使用预测报告保存的设置，不按当前 `data.yaml` 更换数据或评价口径。
 
-默认目标圈为 2，使用居中的五圈窗口，边界截断；默认优化 80 次。`platform_motion`
-由配置明确选择 `static/moving`，不按目录名猜测。固定平台仍保留电机旋转，且
-`motion_poses` 必须为空。场景目标固定在世界坐标中，暂不处理动态目标、身份关联、
-跨帧遮挡推断或全局地图融合。
+默认目标圈为 2，使用居中的五圈窗口，边界截断，表面优化默认执行 80 次。
+`platform_motion` 由配置明确选择 `static/moving`，不按目录名猜测。固定平台采用
+固定平台位姿，雷达仍随电机旋转。场景目标固定在世界坐标中，暂不处理动态目标、
+身份关联、跨帧遮挡推断或全局地图融合。
 
 ## 三幅图与输出文件
 
@@ -106,8 +106,8 @@ Figure 8 风格的零高度带俯视图直接从相同的三维点云取
 
 使用 PanoRadar 论文公式 (11) 的远场波束形成及距离 FFT，在目标圈逐方向选择配置
 距离区间内的最强距离峰，得到论文 Figure 9 所定义的投影。复用目标圈成像体中的
-原生 FFT 格点，去掉补零带来的额外采样；不使用当前算法的多峰选面、近场细化或
-轨迹优化结果。数据半径、波形、通道约定与当前方法一致，孔径采用相同配置值。
+原生 FFT 格点，去掉补零带来的额外采样。基线和当前方法使用同一输入轨迹、数据
+半径、波形、通道约定和孔径配置。
 
 这是本地实现的无学习模型信号处理基线，不是官方学习模型或 CFAR 点云提取器的
 逐字节复现。基线使用目标圈；当前方法按配置使用邻圈。图8风格的原方法点云来自
@@ -117,14 +117,18 @@ Figure 8 风格的零高度带俯视图直接从相同的三维点云取
 
 1. 逐 chirp 计算电机相位和平台位姿，把真实天线位置变换到目标圈开始时 RF 坐标系。
    接缝仅使用实际邻接采样，不复制同一 chirp 充当另一位置。
-2. 运动补偿成像后，每方向保留默认 5 个 RF 距离峰；沿固定射线在各峰附近进行
-   ±7.5 cm、9 点的近场匹配功率搜索，并实际验证连续二次细化的顶点。
-3. 在各源圈自身坐标系中查询同一空间候选的 RF 幅度支持。全景四邻接图在跳变两侧的
+2. 目标圈每方向保留默认 5 个 RF 距离峰，在各峰附近进行 ±7.5 cm、9 点的
+   近场匹配功率搜索，并实际验证连续二次细化的顶点。同时把各圈的 RF 幅度体
+   配准到目标圈的原生距离格点。在每圈分别检查相对幅度和局部噪声底，再对通过
+   门限的响应累加归一化功率。每条射线可从至少两圈（或配置要求的更多圈）支持的
+   局部峰中补入一个与已有峰分离的候选，单圈运行时跳过此步骤。
+3. 在各源圈自身坐标系中复查同一空间候选的 RF 幅度支持，再用统一的目标圈和跨圈
+   代价选面。为限制内存，多圈提名和候选复查分别逐圈生成幅度体。全景四邻接图在跳变两侧的
    候选均满足 RF 支持条件、且各自与同侧邻点的首选深度相符时，降低该候选组合的跨边界
    代价。其余组合沿用截断距离惩罚。默认 12 次阻尼 min-sum BP，求解为近似解。
-4. 以选面结果初始化正距离场、局部分片平面和连续平台轨迹校正，联合优化 RF
-   匹配功率及几何/距离/轨迹先验。默认距离改变量上限 7.5 cm，各平移校正分量
-   上限 5 mm、旋转向量分量上限 0.5°；不优化电机相位。
+4. 以选面结果初始化正距离场和局部分片平面，优化 RF 匹配功率及几何/距离先验。
+   两类移动数据均固定使用从 `motion_output.npz` 积分得到的位姿。默认距离改变量
+   上限 7.5 cm，电机相位保持名义旋转。
 5. 每轮遍历全部 RF 支持点，按实际批量加权积累梯度后更新一次 Adam，正则每轮
    只累积一次。`batch_size` 控制内存，不抽掉尾批或减少点覆盖。
 6. 固定交替采样分为梯度与 RF 验收子集，但初始化使用了全部采样，因此验收子集
@@ -132,17 +136,17 @@ Figure 8 风格的零高度带俯视图直接从相同的三维点云取
 
 局部平面法向只用于几何约束，不是输出的回波法线。模型是每方向单表面的局部
 径向优化，不保证找回初始化之外的表面、多层遮挡、消除多径或达到全局最优。
-RF 验收通过不意味着激光几何误差改善。弱可观测六轴运动由正则约束，不是独立测量。
+RF 验收通过不意味着激光几何误差改善。
 
 ### 最终表面上的回波法线
 
-优化结果固定后，在相同最终三维点和同一套校正后天线几何上，复用相干匹配响应
+优化结果固定后，在相同最终三维点和同一套天线几何上，复用相干匹配响应
 计算 mmNorm 带正负号的方向投票。使用与优化相同的真实固定孔径和视场掩码，不
 重新选面，不运行第二套轨迹，不从距离图求空间梯度，也不把局部平面法向作为预测。
 
-默认 `temporal_fusion: multilook` 在圈内相干，跨圈累加方向统计后归一化；
-`coherent` 需要稳定跨圈相位，运动模式还要求允许来源的外部标定位姿。仅有 RF
-速度积分时明确拒绝相干跨圈投票。未定义法线以零 RHS 表示，主角度评分为 90°。
+默认 `temporal_fusion: multilook` 在圈内相干，跨圈累加方向统计后归一化。
+`coherent` 适用于跨圈相位稳定的固定平台。未定义法线以零 RHS 表示，主角度评分
+为 90°。
 
 内部点到天线方向固定翻转为原标签的朝外约定；训练 XYZ 与 RF XYZ 转换为
 `diag(1,-1,-1)`，再按固定全景基底转换为 `pred_rhs`，不根据标签选择符号。
@@ -154,7 +158,7 @@ RF 验收通过不意味着激光几何误差改善。弱可观测六轴运动�
 | `pred_rhs` | `(3,64,512)` |
 | `normal_comparison` | `(64,512,3)`，RF 坐标系朝外法线 |
 | `normal_defined`、`normal_valid`、`surface_valid` | `(64,512)`，标记不删除主评分像素 |
-| `world_from_platform`、`initial_world_from_platform` | 逐实际采样的校正/原始位姿 |
+| `world_from_platform`、`initial_world_from_platform` | 同一组逐实际采样位姿，后者用于兼容旧产物格式 |
 
 世界坐标依赖输入或积分轨迹的基准，不自动等于地理坐标。
 
@@ -166,15 +170,15 @@ RF 输入均为 2 Tx × 4 Rx 的复数数据，展开成 8 通道，默认扣除
 
 | 数据 | RF 与时钟 | 波形/位姿 |
 |---|---|---|
-| PanoData | `radar_data.npy`、`radar_ts.txt`、`data_params.npz:radar_sep/r_radar` | 原 77–81 GHz 约定；默认 RF 速度和 IMU 积分，保留原 5.5° 方向修正 |
+| PanoData | `radar_data.npy`、`radar_ts.txt`、`data_params.npz:radar_sep/r_radar` | 原 77–81 GHz 约定，保留原 5.5° 方向修正 |
 | SelfData | 未压缩 `radar.npz:frames/timestamps`、`radar_config.yaml`、`data_params.npz:radar_sep/r_radar/imu_sep` | 读取实际参数；用户确认采用 IMU 分帧；RF 方向归约后平滑，不加 5.5° |
 
-运动模式只读取 `motion_output.npz` 的 `v_esti/theta_v_esti/omega_imu`，不读取
-`*_gt`，缺失时不回退到 LiDAR 或相机。每圈速度近似恒定、积分 yaw 构成 SE(2)
-近似，存在运动误差和积分漂移。可用 `motion_poses` 提供同一 RF 时钟下的外部
-`timestamps_s (N,)` 与 `world_from_platform (N,4,4)`；平移线性插值、旋转 SLERP，
-不做外推。位姿原点为旋转中心，轴为 RF 的 x 前、y 左、z 上，外参和时间偏移需
-预先标定；外部位姿必须来自允许的非 LiDAR、非相机来源。
+移动 PanoData 和 SelfData 均要求序列目录内有 `motion_output.npz`。文件缺失时，
+异常会给出当前序列的离线生成命令。从文件仅读取 `v_esti/theta_v_esti/omega_imu`。
+以每圈速度近似恒定，按雷达时间戳积分得到 SE(2) 相对位姿。位姿平移采用线性插值，
+旋转采用 SLERP，查询须在时间覆盖范围内。位姿原点为旋转中心，轴为 RF 的 x 前、
+y 左、z 上。
+成像全程使用该轨迹，输入运动误差和积分漂移会反映在位姿中。
 
 SelfData 对 IMU z 角速度按原规则异常处理和平滑，通过
 `dtheta = 2π/N - delta_t*omega` 确定成像区间，末圈截断到有位姿覆盖的边界。
@@ -236,7 +240,7 @@ RF 支持、置信度、误差大小或最近邻距离均不筛选主评分像�
 ```text
 code/
 ├── config/          # data.yaml、imaging.yaml、统一默认值和评价设置
-├── data/            # PanoData/SelfData，只读输入和输出目录保护
+├── dataset_io/      # PanoData/SelfData，只读输入和输出目录保护
 ├── motion/          # 平台位姿、真实孔径与跨圈方向统计
 ├── imaging/         # 波形、波束形成、选面、联合优化、唯一运行入口
 ├── normals/pixels.py # 固定法线坐标转换与全景打包
@@ -274,11 +278,10 @@ python -m code.visualize_lidar --help
   本项目使用 RF 幅度支持和截断图代价，不是该光学算法的原样实现。
 - [PatchMatch Stereo: Stereo Matching with Slanted Support Windows](https://www.microsoft.com/en-us/research/wp-content/uploads/2011/01/PatchMatchStereo_BMVC2011_6MB.pdf)：
   深度边界处的自适应邻域支持。本项目用多圈 RF 证据和同侧深度连续性调整图代价。
-- [可微 SAR 与自动聚焦](https://ieeexplore.ieee.org/document/9455345)、
-  [连续时间雷达惯性估计](https://arxiv.org/html/2402.06174v2)、
-  [李群累计 B 样条](https://openaccess.thecvf.com/content_CVPR_2020/papers/Sommer_Efficient_Derivative_Computation_for_Cumulative_B-Splines_on_Lie_Groups_CVPR_2020_paper.pdf)：
-  保留原几何优化方法参考；本实现是加性平移/旋转向量的样条校正，不是原论文
-  SE(3) 累计样条。
+- [Enhancing SAR Multipath Ghost Image Suppression for Complex Structures through Multi-Aspect Observation](https://www.mdpi.com/2072-4292/16/4/637)：
+  多视角对照中的散射位置一致性。本项目用空间配准后的 RF 功率支持提名候选，仍可能保留跨视角稳定的多径。
+- [可微 SAR 与自动聚焦](https://ieeexplore.ieee.org/document/9455345)为 RF 匹配
+  功率优化提供参考。
 - SelfData 规则参考本机 [MyRadar 自采几何](/data/glz/project/MyRadar/tools/suradar_core.py)、
   [SURadar 数据与 IMU 分帧](/data/glz/project/SURadar/suradar_SP/dataset.py)、
   [RF 运动估计](/data/glz/project/SURadar/suradar_SP/motion_estimation.py)、

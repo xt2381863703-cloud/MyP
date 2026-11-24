@@ -3,7 +3,6 @@
 platform_motion: moving
 frame_num: 2
 out_folder: null
-motion_poses: null
 geometry_json: null
 temporal_window: 5
 backend: auto
@@ -13,12 +12,9 @@ oversample: 16
 iterations: 80  # Full RF-supported surface passes / Adam updates.
 batch_size: 256  # Memory limit; gradients are accumulated across all batches.
 patch_shape: [4, 8]
-pose_knot_spacing_s: 0.15
-translation_bound_m: 0.005
-rotation_bound_deg: 0.5
 range_bound_m: 0.075
 
-# 回波法线在最终表面与同一校正轨迹上计算，不从距离图求梯度。
+# 回波法线在最终表面与同一逐 chirp 轨迹上计算，不从距离图求梯度。
 temporal_fusion: multilook
 min_coherence: 0.15
 dynamic_range_db: 20

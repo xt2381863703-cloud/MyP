@@ -1,12 +1,11 @@
 """Timestamped platform poses and per-chirp rotating radar registration."""
 
-from pathlib import Path
-
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from scipy.spatial.transform import Rotation, Slerp
 
-from ..data.trajectory import RawTrajectory
+from ..dataset_io.formats import require_motion_output
+from ..dataset_io.trajectory import RawTrajectory
 from ..imaging.core import Geometry
 
 
@@ -36,15 +35,6 @@ class PoseSeries:
         self.slerp = Slerp(self.timestamps, Rotation.from_matrix(rotation))
         self.source = source
 
-    @classmethod
-    def load(cls, path):
-        with np.load(path, allow_pickle=False) as data:
-            return cls(
-                data["timestamps_s"],
-                data["world_from_platform"],
-                str(Path(path).resolve()),
-            )
-
     def at(self, timestamps):
         ts = np.atleast_1d(timestamps).astype(float)
         if np.any(ts < self.timestamps[0]) or np.any(ts > self.timestamps[-1]):
@@ -61,7 +51,7 @@ class PoseSeries:
 
 
 def estimated_pose_series(folder, separators, timestamps, dataset_type="PanoData"):
-    """Integrate original PanoRadar RF velocity estimates and IMU yaw, no GT.
+    """Load precomputed RF velocity and IMU angular velocity, then integrate.
 
     Estimate sign, direction correction and Gaussian smoothing reproduce
     panoradar_SP.dataset.get_motion_params(need_smooth=True). Only _esti and
@@ -70,11 +60,7 @@ def estimated_pose_series(folder, separators, timestamps, dataset_type="PanoData
     yaw is integrated from the per-rotation IMU angular velocity. This is an
     SE(2) approximation, not calibrated sub-wavelength SE(3) ground truth.
     """
-    path = Path(folder) / "motion_output.npz"
-    if not path.is_file():
-        raise FileNotFoundError(
-            "Moving data needs --motion-poses or an existing RF-estimated motion_output.npz; no LiDAR pose fallback"
-        )
+    path = require_motion_output(folder, dataset_type)
     with np.load(path, allow_pickle=False) as data:
         speed = data["v_esti"].astype(float)
         direction = data["theta_v_esti"].astype(float)
@@ -131,14 +117,11 @@ class MotionTrajectory(RawTrajectory):
         self,
         folder,
         subtract_background=True,
-        motion_poses=None,
         platform_motion="moving",
         dataset_type="PanoData",
     ):
         if platform_motion not in ("static", "moving"):
             raise ValueError("platform_motion must be static or moving")
-        if platform_motion == "static" and motion_poses is not None:
-            raise ValueError("Static platforms use fixed poses; set motion_poses: null")
         super().__init__(folder, subtract_background, dataset_type, platform_motion)
         self.platform_motion = platform_motion
         if (
@@ -160,13 +143,10 @@ class MotionTrajectory(RawTrajectory):
                 np.repeat(np.eye(4)[None], 2, axis=0),
                 "fixed platform; identity poses; radar motor rotation retained",
             )
-        elif motion_poses is not None:
-            self.poses = PoseSeries.load(motion_poses)
         else:
             self.poses = estimated_pose_series(
                 self.folder, self.separators, self.timestamps, dataset_type
             )
-        self.estimated_poses = platform_motion == "moving" and motion_poses is None
 
     def registered_frame(self, number, target, aperture, geometry_json=None):
         # Extend with actual adjacent samples; never wrap first/last chirps.

@@ -11,6 +11,8 @@ from scipy.ndimage import map_coordinates, maximum_filter
 
 from .core import radar_pixel_rays
 
+_MIN_PEAK_SNR_DB = 8.0
+
 
 def _range_window(coarse):
     """Keep the original +/- two native range cells after FFT zero padding."""
@@ -83,6 +85,25 @@ def range_candidates(coarse, count, min_range, max_range):
     }
 
 
+def _source_coordinates(source, ranges, min_range, max_range):
+    radius = np.linalg.norm(source, axis=-1)
+    phi = np.arcsin(np.clip(source[..., 2] / np.maximum(radius, 1e-12), -1, 1))
+    theta = np.mod(-np.arctan2(source[..., 1], source[..., 0]), 2 * np.pi)
+    coordinates = np.array(
+        [
+            (radius - ranges[0]) / (ranges[1] - ranges[0]),
+            (np.pi / 4 - phi) * 63 / (np.pi / 2),
+            theta * 511 / (2 * np.pi),
+        ]
+    )
+    valid = (
+        (radius >= max(min_range, ranges[0]))
+        & (radius <= min(max_range, ranges[-1]))
+        & (np.abs(phi) <= np.pi / 4 + 1e-10)
+    )
+    return coordinates.reshape(3, -1), valid
+
+
 def sample_registered_support(
     coarse, target_points, source_from_target, min_range, max_range
 ):
@@ -92,12 +113,8 @@ def sample_registered_support(
     RF poses and range sampling. Out-of-FoV and out-of-range queries are missing,
     not zero evidence; elevation does not wrap across the poles.
     """
-    points = np.asarray(target_points)
     transform = np.asarray(source_from_target)
-    source = points @ transform[:3, :3].T + transform[:3, 3]
-    radius = np.linalg.norm(source, axis=-1)
-    phi = np.arcsin(np.clip(source[..., 2] / np.maximum(radius, 1e-12), -1, 1))
-    theta = np.mod(-np.arctan2(source[..., 1], source[..., 0]), 2 * np.pi)
+    source = np.asarray(target_points) @ transform[:3, :3].T + transform[:3, 3]
     ranges = coarse["range_m"]
     amplitude = np.maximum(np.asarray(coarse["amplitude"], np.float32), 0)
     # Wrap the 511 unique azimuth cells; append the duplicated seam only AFTER filtering.
@@ -110,23 +127,75 @@ def sample_registered_support(
     allowed = (ranges >= min_range) & (ranges <= max_range)
     normalizer = np.maximum(smoothed[allowed].max(axis=0), 1e-20)
     ratio = smoothed / normalizer[None]
-    coordinates = np.array(
-        [
-            radius / (ranges[1] - ranges[0]),
-            (np.pi / 4 - phi) * 63 / (np.pi / 2),
-            theta * 511 / (2 * np.pi),
-        ]
-    )
-    valid = (
-        (radius >= min_range)
-        & (radius <= min(max_range, ranges[-1]))
-        & (np.abs(phi) <= np.pi / 4 + 1e-10)
-    )
+    coordinates, valid = _source_coordinates(source, ranges, min_range, max_range)
     sampled = map_coordinates(
-        ratio, coordinates.reshape(3, -1), order=1, mode="nearest", prefilter=False
-    ).reshape(radius.shape)
+        ratio, coordinates, order=1, mode="nearest", prefilter=False
+    ).reshape(valid.shape)
     cost = np.clip(-20 * np.log10(np.maximum(sampled, 1e-8)), 0, 24)
     return cost.astype(np.float32), valid
+
+
+def _add_registered_candidate(args, coarse, candidates, views, required_views, rays):
+    """Pool corroborated RF power on the target lattice before multi-view peak picking."""
+    resolution = coarse["range_resolution_m"]
+    fft_grid = coarse["range_m"]
+    stride = max(1, round(resolution / (fft_grid[1] - fft_grid[0])))
+    ranges = fft_grid[::stride]
+    ranges = ranges[(ranges >= args.min_range) & (ranges <= args.max_range)]
+    if not len(ranges):
+        return False
+    rays = rays[:, :-1]
+    score = np.zeros((len(ranges), *rays.shape[:2]), np.float32)
+    count = np.zeros(score.shape, dtype=np.int32)
+    relative_floor = 10 ** (-args.surface_support_db / 20)
+    # A look contributes only if its response clears both the relative
+    # amplitude threshold and the 8 dB RF noise-floor criterion.
+    for image, transform in views():
+        grid = image["range_m"]
+        amplitude = image["amplitude"]
+        roi = amplitude[(grid >= args.min_range) & (grid <= args.max_range)]
+        scale = np.maximum(roi.max(axis=0), 1e-20)
+        floor = np.maximum(
+            relative_floor,
+            np.median(roi, axis=0) / scale * 10 ** (_MIN_PEAK_SNR_DB / 20),
+        )
+        ratio = amplitude / scale
+        rotated = rays @ transform[:3, :3].T
+        for start in range(0, len(ranges), 16):
+            sl = slice(start, start + 16)
+            points = ranges[sl, None, None, None] * rotated + transform[:3, 3]
+            coordinates, valid = _source_coordinates(
+                points, grid, args.min_range, args.max_range
+            )
+            observed = map_coordinates(
+                ratio, coordinates, order=1, mode="nearest", prefilter=False
+            ).reshape(valid.shape)
+            local_floor = map_coordinates(
+                floor, coordinates[1:], order=1, mode="nearest", prefilter=False
+            ).reshape(valid.shape)
+            supported = valid & (observed > 0) & (observed >= local_floor)
+            count[sl] += supported
+            score[sl] += np.where(supported, observed**2, 0)
+        del ratio, roi, amplitude, image
+    score[count < required_views] = 0
+    del count
+    maxima = score >= maximum_filter(score, size=(5, 1, 1), mode="nearest")
+    keep_apart = max(2 * resolution, args.surface_refine_radius_m)
+    for depth, valid in zip(
+        candidates["range_m"][:, :-1].transpose(2, 0, 1),
+        candidates["valid"][:, :-1].transpose(2, 0, 1),
+    ):
+        maxima &= ~((np.abs(ranges[:, None, None] - depth) <= keep_apart) & valid)
+    indices = np.argmax(np.where(maxima, score, 0), axis=0)
+    chosen = np.take_along_axis(maxima & (score > 0), indices[None], axis=0)[0]
+    if not chosen.any():
+        return False
+    depth = ranges[indices].astype(np.float32)
+    # Preserve the existing target hypotheses, including their fallback order.
+    for key, values in (("range_m", depth), ("valid", chosen)):
+        seam = np.concatenate((values, values[:, :1]), axis=1)
+        candidates[key] = np.concatenate((candidates[key], seam[..., None]), axis=2)
+    return True
 
 
 def surface_graph(
@@ -225,7 +294,7 @@ def optimize_candidates(
 def select_motion_surface(
     args, trajectory, target, frames, coarse, image_function, refine_candidates=None
 ):
-    """Target RF candidates, source-local volumes and registered multi-view support."""
+    """Combine target peaks with independently corroborated multi-view candidates."""
     candidates = range_candidates(
         coarse, args.surface_candidates, args.min_range, args.max_range
     )
@@ -233,15 +302,21 @@ def select_motion_surface(
         refine_candidates(candidates) if refine_candidates is not None else None
     )
     rays = radar_pixel_rays()
-    points = rays[..., None, :] * candidates["range_m"][..., None]
     target_pose = trajectory.poses.at(
         trajectory.timestamps[trajectory.separators[target]]
     )[0]
-    costs, observations = [], []
+    transforms = {}
     for number in frames:
-        if number == target:
-            source_coarse = coarse
-        else:
+        pose = trajectory.poses.at(trajectory.timestamps[trajectory.separators[number]])[0]
+        transforms[number] = (
+            np.eye(4) if number == target else np.linalg.solve(pose, target_pose)
+        )
+
+    def views():
+        for number, transform in transforms.items():
+            if number == target:
+                yield coarse, transform
+                continue
             frame, geometry, facing, origins, _ = trajectory.registered_frame(
                 number, number, args.aperture, args.geometry_json
             )
@@ -249,16 +324,24 @@ def select_motion_surface(
                 frame, geometry, origins, facing, args.aperture, args.backend
             )
             del frame
-        source_pose = trajectory.poses.at(
-            trajectory.timestamps[trajectory.separators[number]]
-        )[0]
+            yield source_coarse, transform
+            del source_coarse
+
+    required_views = max(2, min(args.surface_min_views, len(frames)))
+    registered = len(frames) > 1 and _add_registered_candidate(
+        args, coarse, candidates, views, required_views, rays
+    )
+    points = rays[..., None, :] * candidates["range_m"][..., None]
+    costs, observations = [], []
+    for source_coarse, transform in views():
         cost, visible = sample_registered_support(
             source_coarse,
             points,
-            np.linalg.inv(source_pose) @ target_pose,
+            transform,
             args.min_range,
             args.max_range,
         )
+        del source_coarse
         costs.append(cost)
         observations.append(visible)
     costs, observed = np.stack(costs), np.stack(observations)
@@ -270,17 +353,24 @@ def select_motion_surface(
         where=count > 0,
     )
     target_cost = np.clip(-candidates["relative_db"], 0, 24)
+    support = ((costs <= args.surface_support_db) & observed).sum(axis=0)
+    if registered:
+        candidates["valid"][..., -1] &= support[..., -1] >= required_views
+        target_cost = np.concatenate(
+            (target_cost, costs[frames.index(target), ..., -1:]), axis=-1
+        )
     unary = (
         (1 - args.surface_temporal_weight) * target_cost
         + args.surface_temporal_weight * temporal
     ).astype(np.float32)
     unary[~candidates["valid"]] = 1e4
-    support = ((costs <= args.surface_support_db) & observed).sum(axis=0)
     candidate_support = (
         candidates["valid"]
         & (support >= min(args.surface_min_views, len(frames)))
-        & (candidates["peak_snr_db"][..., None] >= 8)
+        & (candidates["peak_snr_db"][..., None] >= _MIN_PEAK_SNR_DB)
     )
+    if registered:
+        candidate_support[..., -1] = candidates["valid"][..., -1]
     labels, _ = optimize_candidates(
         unary[:, :-1],
         candidates["range_m"][:, :-1],
@@ -301,9 +391,16 @@ def select_motion_surface(
         "surface_valid": surface_valid,
     }
     metadata = {
-        "method": "motion_registered_multipeak_edge_aware_bp",
+        "method": "registered_power_candidates_edge_aware_bp",
         "source_frames": frames,
         "candidates": args.surface_candidates,
+        "registered_proposals_min_views": required_views if len(frames) > 1 else None,
+        "registered_proposal_pixels": (
+            int(candidates["valid"][:, :-1, -1].sum()) if registered else 0
+        ),
+        "registered_selected_pixels": (
+            int((labels[:, :-1] == args.surface_candidates).sum()) if registered else 0
+        ),
         "temporal_weight": args.surface_temporal_weight,
         "spatial_weight": args.surface_spatial_weight,
         "supported_surface_fraction": float(surface_valid.mean()),

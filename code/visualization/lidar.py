@@ -17,7 +17,7 @@ from ..config.data import (
     validate_data_settings,
 )
 from ..config.evaluation import EVALUATION_DEFAULTS
-from ..data.trajectory import prepare_output_folder
+from ..dataset_io.trajectory import prepare_output_folder
 
 
 def main():

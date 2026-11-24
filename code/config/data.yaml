@@ -2,9 +2,9 @@
 # python -m code.image_scene
 # 自采数据 - SelfData
 # PanoRadar 数据 - PanoData
-dataset_type: SelfData  
-in_traj_folder: /mnt/dataset/suradar/raw/8#402_moving/exp260521_000
-# in_traj_folder: /mnt/dataset/panoradar/raw/design_moving/exp20230524-000
+dataset_type: PanoData  
+# in_traj_folder: /mnt/dataset/suradar/raw/8#402_moving/exp260521_000
+in_traj_folder: /mnt/dataset/panoradar/raw/design_moving/exp20230524-000
 
 # PanoData 示例：同时修改以上两项。
 # dataset_type: PanoData

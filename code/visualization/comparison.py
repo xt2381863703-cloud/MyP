@@ -187,7 +187,7 @@ def plot_normals(
             note = "自采数据未提供玻璃像素掩码：两种激光参考相同，不推断玻璃区域，也不补造缺失法线"
             filtered_title = "激光法线：当前评价参考（未提供玻璃标注，未作玻璃剔除）"
         fig.suptitle(
-            f"第 {args.frame_num} 圈｜回波法线对比\n当前法线由最终表面和同一校正轨迹上的复数回波投票计算；不使用距离梯度\n{note}\n保持原法线颜色和有方向夹角计算；未定义的射频法线按90度计分；未剔除玻璃的参考仅展示\n全景图显示俯仰 {_elevation_limits(args)} 度；统计与累计分布使用完整评价区域\n{ERROR_COLOR_NOTE}",
+            f"第 {args.frame_num} 圈｜回波法线对比\n当前法线由最终表面和同一逐 chirp 轨迹上的复数回波投票计算；不使用距离梯度\n{note}\n保持原法线颜色和有方向夹角计算；未定义的射频法线按90度计分；未剔除玻璃的参考仅展示\n全景图显示俯仰 {_elevation_limits(args)} 度；统计与累计分布使用完整评价区域\n{ERROR_COLOR_NOTE}",
             fontsize=12,
         )
         current = rhs_to_normal(prediction["pred_rhs"].transpose(1, 2, 0))

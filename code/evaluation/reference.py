@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from ..config.evaluation import EVALUATION_DEFAULTS
-from ..data.formats import dataset_root
+from ..dataset_io.formats import dataset_root
 
 
 def reference_method(args):

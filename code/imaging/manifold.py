@@ -1,7 +1,7 @@
-"""RF autofocus and piecewise surface estimation on a product manifold.
+"""RF matching and piecewise surface estimation on a product manifold.
 
-The state contains positive ranges, local unit plane normals/positive offsets,
-and an anchored continuous SO(3) x R^3 correction to the supplied trajectory.
+The state contains positive ranges and local unit plane normals/positive offsets.
+Per-chirp geometry uses the supplied trajectory throughout reconstruction.
 Complex range matching follows imaging.core.MatchedResponse. Rotations are
 coherent internally; different rotations contribute separate power objectives.
 """
@@ -11,7 +11,6 @@ from functools import partial
 
 import numpy as np
 import torch
-from scipy.interpolate import BSpline
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 
@@ -40,22 +39,6 @@ def _array(value):
     if value.dtype == torch.bool:
         return np.from_dlpack(value.detach().to(torch.uint8).cpu()).astype(bool)
     return np.from_dlpack(value.detach().cpu()).copy()
-
-
-def _rotation(vector):
-    """Rodrigues exponential with finite derivatives at zero."""
-    x, y, z = vector.unbind(-1)
-    zero = torch.zeros_like(x)
-    skew = torch.stack((zero, -z, y, z, zero, -x, -y, x, zero), -1)
-    skew = skew.reshape(*vector.shape[:-1], 3, 3)
-    theta = torch.sqrt(vector.square().sum(-1) + 1e-20)
-    a = torch.sinc(theta / torch.pi)[..., None, None]
-    b = (0.5 * torch.sinc(theta / (2 * torch.pi)).square())[..., None, None]
-    return (
-        torch.eye(3, dtype=vector.dtype, device=vector.device)
-        + a * skew
-        + b * (skew @ skew)
-    )
 
 
 def _patches(ranges, rays, supported, shape):
@@ -126,7 +109,7 @@ def _patches(ranges, rays, supported, shape):
 
 
 class _Scene(torch.nn.Module):
-    def __init__(self, initial, supported, args, basis_count, device):
+    def __init__(self, initial, supported, args, device):
         super().__init__()
         rays = radar_pixel_rays()[:, :-1]
         ranges = np.linalg.norm(initial[:, :-1], axis=-1)
@@ -153,17 +136,6 @@ class _Scene(torch.nn.Module):
             torch.zeros((len(normals), 2), device=device, dtype=torch.float64)
         )
         self.offset_chart = torch.nn.Parameter(torch.zeros_like(self.offsets))
-        self.pose_chart = torch.nn.Parameter(
-            torch.zeros((basis_count, 6), device=device, dtype=torch.float64),
-            requires_grad=args.platform_motion == "moving",
-        )
-        self.pose_scale = _tensor(
-            np.r_[
-                np.full(3, args.translation_bound_m),
-                np.full(3, np.deg2rad(args.rotation_bound_deg)),
-            ],
-            device,
-        )
         self.args = args
 
     def ranges(self):
@@ -183,9 +155,6 @@ class _Scene(torch.nn.Module):
         )
         return normal, offset
 
-    def correction(self, basis):
-        return basis @ (torch.tanh(self.pose_chart) * self.pose_scale)
-
     def regularizer(self):
         normal, offset = self.planes()
         residual = (
@@ -196,9 +165,6 @@ class _Scene(torch.nn.Module):
             (torch.sqrt(1 + residual.square()) - 1) * weight
         ).sum() / weight.sum().clamp_min(1)
         range_prior = torch.tanh(self.range_chart).square().mean()
-        controls = torch.tanh(self.pose_chart)
-        pose_prior = controls.square().mean()
-        smooth = (controls[2:] - 2 * controls[1:-1] + controls[:-2]).square().mean()
         chart_prior = (
             torch.tanh(self.normal_chart).square().mean()
             + torch.tanh(self.offset_chart).square().mean()
@@ -206,7 +172,6 @@ class _Scene(torch.nn.Module):
         total = (
             self.args.geometry_weight * plane
             + self.args.range_prior_weight * range_prior
-            + self.args.pose_prior_weight * (pose_prior + smooth)
             + 0.001 * chart_prior
         )
         return total, plane
@@ -269,35 +234,20 @@ class _Look:
         self.indices = torch.cat(self.indices)
         self.mask = torch.cat(self.mask)
 
-    def geometry(self, scene):
-        delta = scene.correction(self.basis)
-        rotation = _rotation(delta[:, 3:])
-
-        def transform(points):
-            return torch.einsum("nij,ncj->nci", rotation, points) + delta[:, None, :3]
-
-        positions = transform(self.positions)
-        return (
-            positions,
-            None if self.tx is None else transform(self.tx),
-            None if self.rx is None else transform(self.rx),
-        )
-
     def response(self, scene, selected, split=None):
         ids, mask = self.indices[selected], self.mask[selected]
         if split is not None:
             ids, mask = ids[:, split::2], mask[:, split::2]
-        positions, tx, rx = self.geometry(scene)
-        return self.sample(scene.points()[selected], ids, mask, positions, tx, rx)
+        return self.sample(scene.points()[selected], ids, mask)
 
-    def sample(self, points, ids, mask, positions, tx, rx):
+    def sample(self, points, ids, mask):
         point = points[:, None, None]
-        if tx is None:
-            path = 2 * torch.linalg.vector_norm(positions[ids] - point, dim=-1)
+        if self.tx is None:
+            path = 2 * torch.linalg.vector_norm(self.positions[ids] - point, dim=-1)
         else:
             path = torch.linalg.vector_norm(
-                tx[ids] - point, dim=-1
-            ) + torch.linalg.vector_norm(rx[ids] - point, dim=-1)
+                self.tx[ids] - point, dim=-1
+            ) + torch.linalg.vector_norm(self.rx[ids] - point, dim=-1)
         radius = torch.linalg.vector_norm(point[:, 0, 0], dim=-1)[:, None, None]
         delta = path - 2 * radius
         frequency = (
@@ -323,9 +273,6 @@ class _Look:
             _tensor(points, self.device),
             ids,
             torch.ones_like(ids, dtype=torch.bool),
-            self.positions,
-            self.tx,
-            self.rx,
         )
         value = _array(response) if self.xp is np else self.xp.from_dlpack(response)
         return value, None
@@ -371,26 +318,26 @@ def _measure(scene, looks, batch_size):
 
 @torch.no_grad()
 def _final_normals(scene, looks, points, args):
-    """Vote at finalized points with the exact same corrected matching geometry."""
+    """Vote at finalized points with the same per-chirp matching geometry."""
     count = len(scene.rays)
     targets = scene.points()
     stats = {}
     for look in looks:
-        positions, tx, rx = look.geometry(scene)
         for start in range(0, count, args.batch_size):
             selected = torch.arange(
                 start, min(start + args.batch_size, count), device=scene.rays.device
             )
             ids, mask = look.indices[selected], look.mask[selected]
             target = targets[selected]
-            response, _ = look.sample(target, ids, mask, positions, tx, rx)
-            if tx is None:
-                ray = positions[ids] - target[:, None, None]
+            response, _ = look.sample(target, ids, mask)
+            if look.tx is None:
+                ray = look.positions[ids] - target[:, None, None]
                 directions = ray / torch.linalg.vector_norm(
                     ray, dim=-1, keepdim=True
                 ).clamp_min(1e-12)
             else:
-                a, b = tx[ids] - target[:, None, None], rx[ids] - target[:, None, None]
+                a = look.tx[ids] - target[:, None, None]
+                b = look.rx[ids] - target[:, None, None]
                 directions = a / torch.linalg.vector_norm(
                     a, dim=-1, keepdim=True
                 ).clamp_min(1e-12) + b / torch.linalg.vector_norm(
@@ -451,9 +398,9 @@ def reconstruct(args, trajectory):
     frames = temporal_frames(
         args.frame_num, trajectory.frame_count, args.temporal_window
     )
-    if args.temporal_fusion == "coherent" and trajectory.estimated_poses:
+    if args.temporal_fusion == "coherent" and trajectory.platform_motion == "moving":
         raise ValueError(
-            "Coherent normal fusion requires calibrated external poses and stable inter-rotation phase"
+            "Coherent normal fusion requires a static platform and stable inter-rotation phase"
         )
     record = trajectory.frame_metadata(args.frame_num)
     if args.aperture > min(
@@ -516,28 +463,9 @@ def reconstruct(args, trajectory):
     looks = [
         _Look(trajectory, number, args.frame_num, args, device) for number in frames
     ]
-    first, last = (
-        min(x.timestamps[0] for x in looks),
-        max(x.timestamps[-1] for x in looks),
-    )
-    if (last - first) / args.pose_knot_spacing_s > 256:
-        raise ValueError(
-            "Trajectory correction exceeds 256 spline intervals; increase pose_knot_spacing_s"
-        )
-    internal = np.arange(
-        args.pose_knot_spacing_s, last - first, args.pose_knot_spacing_s
-    )
-    knots = np.r_[np.zeros(4), internal, np.full(4, last - first)]
-    spline = BSpline(knots, np.eye(len(knots) - 4), 3, extrapolate=False)
     anchor_time = trajectory.timestamps[int(trajectory.separators[args.frame_num])]
-    anchor_basis = spline(anchor_time - first)
-    scene = _Scene(initial, fields["surface_valid"], args, len(knots) - 4, device)
+    scene = _Scene(initial, fields["surface_valid"], args, device)
     for look in looks:
-        # Center and scale the basis to fix the reference pose and bound each
-        # correction component by its configured coefficient scale.
-        look.basis = _tensor(
-            0.5 * (spline(look.timestamps - first) - anchor_basis), device
-        )
         look.apertures(scene.points().detach(), args.aperture, args.batch_size)
     stages["manifold_and_spectra_setup_seconds"] = time.monotonic() - stage_started
     stage_started = time.monotonic()
@@ -548,7 +476,7 @@ def reconstruct(args, trajectory):
     noise = initial_power.median(dim=1).values.clamp_min(1e-20) * 0.01
     supported = torch.nonzero(scene.supported, as_tuple=False).flatten()
     if len(supported) < 16 or initial_power.max().item() <= 1e-20:
-        raise ValueError("Insufficient RF-supported surface for joint optimization")
+        raise ValueError("Insufficient RF-supported surface for optimization")
     random = np.random.default_rng(args.seed)
     validation = supported[
         _tensor(
@@ -589,7 +517,7 @@ def reconstruct(args, trajectory):
         optimizer.zero_grad()
         training_rf = torch.zeros((), dtype=torch.float64, device=device)
         # Accumulate the full surface mean, including a short final batch,
-        # before updating shared trajectory and per-point surface parameters.
+        # before updating surface parameters.
         for start in range(0, len(supported), args.batch_size):
             ids = supported[start : start + args.batch_size]
             rf = rf_objective(ids, 0, training_power[:, ids])
@@ -663,17 +591,9 @@ def reconstruct(args, trajectory):
     normal_fields["normal_valid"] &= fields["surface_valid"]
     stages["final_echo_normals_seconds"] = time.monotonic() - normal_started
     times = np.concatenate([look.timestamps for look in looks])
-    bases = _tensor(0.5 * (spline(times - first) - anchor_basis), device)
     with torch.no_grad():
-        correction = scene.correction(bases)
-        rotation = _array(_rotation(correction[:, 3:]))
-        correction_array = _array(correction)
         plane_normals, plane_offsets = scene.planes()
-    prior = np.linalg.inv(anchor)[None] @ trajectory.poses.at(times)
-    delta = np.broadcast_to(np.eye(4), prior.shape).copy()
-    delta[:, :3, :3] = rotation
-    delta[:, :3, 3] = correction_array[:, :3]
-    corrected = delta @ prior
+    poses = trajectory.poses.at(times)
     result = {
         **baseline,
         **normal_fields,
@@ -707,8 +627,8 @@ def reconstruct(args, trajectory):
             [panorama(x.reshape(64, 511)) for x in _array(reflectivity)]
         ),
         "pose_timestamps_s": times,
-        "world_from_platform": anchor[None] @ corrected,
-        "initial_world_from_platform": anchor[None] @ prior,
+        "world_from_platform": poses,
+        "initial_world_from_platform": poses.copy(),
     }
     for name, value in result.items():
         if not np.isfinite(value).all():
@@ -717,7 +637,7 @@ def reconstruct(args, trajectory):
         record,
         prediction_uses_lidar=False,
         single_reconstruction=True,
-        normal_estimation="signed RF echo votes at the finalized surface and the same corrected per-chirp geometry; no range gradients",
+        normal_estimation="signed RF echo votes at the finalized surface with the same per-chirp geometry; no range gradients",
         normal_fusion=args.temporal_fusion,
         panoradar_baseline={
             "method": "PanoRadar Eq. 11 beamforming; native range FFT peak per direction as Figure 9; no neural network",
@@ -726,21 +646,22 @@ def reconstruct(args, trajectory):
             "native_range_bins": trajectory.waveform.samples,
             "range_refinement": False,
             "surface_graph": False,
-            "scope": "independent local equation implementation using the target RF circle and the supplied prior geometry; not the learned model or CFAR extraction",
+            "scope": "independent local equation implementation using the target RF circle and input trajectory geometry",
         },
         initialization=initialization,
         source_frames=frames,
         sample_intervals=[look.record["registered_raw_indices"] for look in looks],
         pose_source=trajectory.poses.source,
+        pose_refinement_enabled=False,
         backend=str(device),
         device_name=torch.cuda.get_device_name(device)
         if device.type == "cuda"
         else "CPU",
         torch_version=torch.__version__,
         numpy_version=np.__version__,
-        state_space="positive radial surface field; local S2 x R+ planes; anchored continuous SO(3) x R3 trajectory correction",
+        state_space="positive radial surface field and local S2 x R+ planes",
         phase_model="coherent within each disjoint rotation; separate powers and complex reflectivities across rotations",
-        objective="log matched-power ratio with RF-only acceptance and robust local plane/range/trajectory priors",
+        objective="log matched-power ratio with RF-only acceptance and robust local plane/range priors",
         optimization_accepted=accepted,
         optimization_coverage={
             "sampling": "full supported surface per Adam step; batch-weighted RF gradient accumulation",
@@ -758,12 +679,6 @@ def reconstruct(args, trajectory):
         prediction_seconds=time.monotonic() - started,
         stages=stages,
         surface_support_reference="RF initialization; never used to exclude primary evaluation pixels",
-        maximum_translation_correction_m=float(
-            np.linalg.norm(correction_array[:, :3], axis=-1).max()
-        ),
-        maximum_rotation_correction_deg=float(
-            np.rad2deg(np.linalg.norm(correction_array[:, 3:], axis=-1).max())
-        ),
         initial_mean_coherence=float(initial_coherence[:, supported].mean().item()),
         final_mean_coherence=float(coherence[:, supported].mean().item()),
         range_correction={
@@ -790,8 +705,7 @@ def reconstruct(args, trajectory):
         limitations=[
             "Local single-surface radial charts initialized from RF peaks; no guarantee of global optimum or recovery outside those branches",
             "Effective PanoRadar array unless calibrated Tx/Rx geometry is supplied; nominal motor angles remain fixed",
-            "Small bounded trajectory corrections; weakly observed six-axis motion is regularized, not independently measured",
-            "Matched-power autofocus is not a full multiple-scatterer or multipath forward inversion",
+            "Matched-power surface optimization is not a full multiple-scatterer or multipath forward inversion",
             "RF acceptance chirps are excluded from gradient updates, but initialization uses all chirps",
         ],
     )

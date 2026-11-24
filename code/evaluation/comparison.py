@@ -14,7 +14,7 @@ def _statistics(values):
     }
 
 
-def compare(prediction, reference, args):
+def compare(prediction, reference, args, *, pose_refinement_enabled=True):
     """GT-only masks; neither confidence nor error magnitude selects score pixels."""
     depth = reference["range_image_m"]
     mask = np.isfinite(depth) & (depth >= args.min_range) & (depth < args.max_range)
@@ -24,6 +24,7 @@ def compare(prediction, reference, args):
     truth_points = reference["points_m"].reshape(64, 512, 3)
     position_mask = mask & np.isfinite(truth_points).all(axis=-1)
     arrays = {"range_mask": mask, "position_mask": position_mask}
+    trajectory = "corrected trajectory" if pose_refinement_enabled else "input trajectory"
     evaluation = {
         "range": {},
         "position": {},
@@ -31,7 +32,10 @@ def compare(prediction, reference, args):
         "mask_uses_rf_confidence": False,
         "range_mask": "same finite measured LiDAR range in the configured interval, retaining glass regions and excluding the duplicate panorama endpoint",
         "position_mask": "same range mask with finite measured XYZ; paired panorama pixels, not prediction-selected nearest neighbors",
-        "scope": "PanoRadar baseline uses native FFT peaks from the target circle; current range, points and echo normals share one finalized surface and corrected trajectory",
+        "scope": (
+            "PanoRadar baseline uses native FFT peaks from the target circle; "
+            f"current range, points and echo normals share one finalized surface and {trajectory}"
+        ),
     }
     for name, range_key, point_key in (
         ("panoradar", "panoradar_range_m", "panoradar_points_m"),

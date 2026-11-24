@@ -4,7 +4,7 @@ from pathlib import Path
 
 import yaml
 
-from ..data.formats import dataset_root
+from ..dataset_io.formats import dataset_root
 from .paths import CONFIG_ROOT, PROJECT_ROOT
 
 DEFAULT_DATA_CONFIG = CONFIG_ROOT / "data.yaml"
