@@ -12,17 +12,20 @@ from pathlib import Path
 import numpy as np
 from scipy import fft
 
+from .coordinates import panoramic_angles
+
 C = 2.99792e8
 VIRTUAL_SPACING_M = 1.9e-3
 
 
-def radar_pixel_rays():
+def radar_pixel_rays(azimuth_columns=512):
     """Fixed RF directions, including the duplicated panoramic endpoint."""
-    theta = np.linspace(0, -2 * np.pi, 512)[None, :]
-    phi = np.linspace(np.pi / 4, -np.pi / 4, 64)[:, None]
+    azimuth, elevation = panoramic_angles(azimuth_columns)
     return np.stack(
         np.broadcast_arrays(
-            np.cos(phi) * np.cos(theta), np.cos(phi) * np.sin(theta), np.sin(phi)
+            np.cos(elevation) * np.cos(azimuth),
+            np.cos(elevation) * np.sin(azimuth),
+            np.sin(elevation),
         ),
         axis=-1,
     )

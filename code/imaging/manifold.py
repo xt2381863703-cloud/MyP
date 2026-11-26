@@ -7,6 +7,7 @@ coherent internally; different rotations contribute separate power objectives.
 """
 
 import time
+from dataclasses import dataclass
 from functools import partial
 
 import numpy as np
@@ -25,7 +26,7 @@ from .core import C, backend, radar_pixel_rays
 from .selection import select_motion_surface
 
 
-def _tensor(value, device):
+def _to_tensor(value, device):
     # DLPack also supports the installed Torch 2 / NumPy 2 combination.
     array = np.ascontiguousarray(value)
     boolean = array.dtype == bool
@@ -35,13 +36,13 @@ def _tensor(value, device):
     return result.bool() if boolean else result
 
 
-def _array(value):
+def _to_numpy(value):
     if value.dtype == torch.bool:
         return np.from_dlpack(value.detach().to(torch.uint8).cpu()).astype(bool)
     return np.from_dlpack(value.detach().cpu()).copy()
 
 
-def _patches(ranges, rays, supported, shape):
+def _initialize_planar_patches(ranges, rays, supported, shape):
     """Local connected patches; depth discontinuities split a chart."""
     h, w = ranges.shape
     rows, cols = np.indices((h, w))
@@ -108,26 +109,27 @@ def _patches(ranges, rays, supported, shape):
     return labels, normals, offsets, basis
 
 
-class _Scene(torch.nn.Module):
-    def __init__(self, initial, supported, args, device):
+class _RadialSurface(torch.nn.Module):
+    def __init__(self, initial, supported, range_upper_m, args, device):
         super().__init__()
-        rays = radar_pixel_rays()[:, :-1]
+        rays = radar_pixel_rays(initial.shape[1])[:, :-1]
         ranges = np.linalg.norm(initial[:, :-1], axis=-1)
-        labels, normals, offsets, tangent = _patches(
+        labels, normals, offsets, tangent = _initialize_planar_patches(
             ranges, rays, supported[:, :-1], args.patch_shape
         )
-        self.rays = _tensor(rays.reshape(-1, 3), device)
-        self.initial_range = _tensor(ranges.ravel(), device)
-        self.supported = _tensor(supported[:, :-1].ravel(), device)
-        self.labels = _tensor(labels, device)
-        self.normals = _tensor(normals, device)
-        self.offsets = _tensor(offsets, device)
-        self.tangent = _tensor(tangent, device)
+        self.rays = _to_tensor(rays.reshape(-1, 3), device)
+        self.initial_range = _to_tensor(ranges.ravel(), device)
+        self.supported = _to_tensor(supported[:, :-1].ravel(), device)
+        self.labels = _to_tensor(labels, device)
+        self.normals = _to_tensor(normals, device)
+        self.offsets = _to_tensor(offsets, device)
+        self.tangent = _to_tensor(tangent, device)
+        upper = _to_tensor(range_upper_m[:, :-1].ravel(), device)
         self.range_scale = torch.minimum(
             torch.log1p(args.range_bound_m / self.initial_range),
             torch.minimum(
                 torch.log(self.initial_range / args.min_range).clamp_min(0),
-                torch.log(args.max_range / self.initial_range).clamp_min(0),
+                torch.log(upper / self.initial_range).clamp_min(0),
             ),
         )
         self.offset_scale = torch.log1p(args.range_bound_m / self.offsets)
@@ -138,13 +140,13 @@ class _Scene(torch.nn.Module):
         self.offset_chart = torch.nn.Parameter(torch.zeros_like(self.offsets))
         self.args = args
 
-    def ranges(self):
-        return self.initial_range * torch.exp(
-            self.range_scale * torch.tanh(self.range_chart)
+    def ranges(self, selected=slice(None)):
+        return self.initial_range[selected] * torch.exp(
+            self.range_scale[selected] * torch.tanh(self.range_chart[selected])
         )
 
-    def points(self):
-        return self.ranges()[:, None] * self.rays
+    def points(self, selected=slice(None)):
+        return self.ranges(selected)[:, None] * self.rays[selected]
 
     def planes(self):
         delta = 0.35 * torch.tanh(self.normal_chart)
@@ -177,68 +179,75 @@ class _Scene(torch.nn.Module):
         return total, plane
 
 
-class _Look:
-    def __init__(self, trajectory, number, target, args, device, include_padding=False):
-        frame, geometry, facing, origins, record = trajectory.registered_frame(
-            number, target, args.aperture, args.geometry_json
-        )
-        start, end = trajectory.core_bounds(number)
+class _RegisteredRadarLook:
+    def __init__(
+        self,
+        trajectory,
+        number,
+        registered_frame,
+        args,
+        device,
+        xp,
+        *,
+        include_padding=False,
+    ):
+        frame, geometry, facing, origins, record = registered_frame
         raw_lo = record["registered_raw_indices"][0]
         if include_padding:
             start, end = record["registered_raw_indices"]
+        else:
+            start, end = trajectory.core_bounds(number)
         take = slice(start - raw_lo, end - raw_lo)
         frame = frame[take]
         self.wave = trajectory.waveform
-        self.positions = _tensor(geometry.phase_centers_m[take], device)
+        self.positions = _to_tensor(geometry.phase_centers_m[take], device)
         self.tx = (
-            None if geometry.tx_m is None else _tensor(geometry.tx_m[take], device)
+            None if geometry.tx_m is None else _to_tensor(geometry.tx_m[take], device)
         )
         self.rx = (
-            None if geometry.rx_m is None else _tensor(geometry.rx_m[take], device)
+            None if geometry.rx_m is None else _to_tensor(geometry.rx_m[take], device)
         )
-        self.facing = _tensor(facing[take], device)
-        self.origins = _tensor(origins[take], device)
+        self.facing = _to_tensor(facing[take], device)
+        self.origins = _to_tensor(origins[take], device)
         self.timestamps = trajectory.timestamps[start:end]
-        self.number = number
         self.record = dict(record, registered_raw_indices=[start, end])
         self.nfft = frame.shape[-1] * args.oversample
         window = torch.hann_window(frame.shape[-1], periodic=False, device=device)
-        signal = _tensor(frame, device)
+        signal = _to_tensor(frame, device)
         self.spectrum = (
             torch.fft.fft(signal * window, n=self.nfft, dim=-1) / window.sum()
         )
         self.device = device
-        self.xp = backend(args.backend)
-        self.indices, self.mask = [], []
+        self.xp = xp
 
-    @torch.no_grad()
-    def select_aperture(self, points, origins, facing, count):
-        point = _tensor(points, self.device)
-        ray = point[:, None] - self.origins[None]
+    def _aperture(self, points, count):
+        ray = points[:, None] - self.origins[None]
         cosine = (ray * self.facing).sum(-1) / torch.linalg.vector_norm(
             ray, dim=-1
         ).clamp_min(1e-12)
-        ids = torch.topk(cosine, count, dim=-1).indices.sort(-1).values
-        return _array(ids), _array(cosine.gather(1, ids) >= np.cos(np.pi / 4))
+        indices = torch.topk(cosine, count, dim=-1).indices.sort(-1).values
+        return indices, cosine.gather(1, indices) >= np.cos(np.pi / 4)
 
     @torch.no_grad()
-    def apertures(self, points, count, batch_size):
-        for start in range(0, len(points), batch_size):
-            ray = points[start : start + batch_size, None] - self.origins[None]
-            cosine = (ray * self.facing).sum(-1) / torch.linalg.vector_norm(
-                ray, dim=-1
-            ).clamp_min(1e-12)
-            ids = torch.topk(cosine, count, dim=-1).indices.sort(-1).values
-            self.indices.append(ids)
-            self.mask.append(cosine.gather(1, ids) >= np.cos(np.pi / 4))
-        self.indices = torch.cat(self.indices)
-        self.mask = torch.cat(self.mask)
+    def select_aperture(self, points, _origins, _facing, count):
+        indices, mask = self._aperture(_to_tensor(points, self.device), count)
+        return _to_numpy(indices), _to_numpy(mask)
 
-    def response(self, scene, selected, split=None):
+    @torch.no_grad()
+    def prepare_apertures(self, points, count, batch_size):
+        index_batches, mask_batches = [], []
+        for start in range(0, len(points), batch_size):
+            indices, mask = self._aperture(points[start : start + batch_size], count)
+            index_batches.append(indices)
+            mask_batches.append(mask)
+        self.indices = torch.cat(index_batches)
+        self.mask = torch.cat(mask_batches)
+
+    def response(self, points, selected, split=None):
         ids, mask = self.indices[selected], self.mask[selected]
         if split is not None:
             ids, mask = ids[:, split::2], mask[:, split::2]
-        return self.sample(scene.points()[selected], ids, mask)
+        return self.sample(points, ids, mask)
 
     def sample(self, points, ids, mask):
         point = points[:, None, None]
@@ -268,22 +277,23 @@ class _Look:
 
     @torch.no_grad()
     def contributions(self, points, indices):
-        ids = _tensor(indices, self.device)
+        ids = _to_tensor(indices, self.device)
         response, _ = self.sample(
-            _tensor(points, self.device),
+            _to_tensor(points, self.device),
             ids,
             torch.ones_like(ids, dtype=torch.bool),
         )
-        value = _array(response) if self.xp is np else self.xp.from_dlpack(response)
+        value = _to_numpy(response) if self.xp is np else self.xp.from_dlpack(response)
         return value, None
 
     def power(self, scene, selected, split=None):
-        response, count = self.response(scene, selected, split)
+        response, count = self.response(scene.points(selected), selected, split)
         return (response.sum((1, 2)).abs() / count.clamp_min(1)).square()
 
 
 @torch.no_grad()
-def _measure(scene, looks, batch_size):
+def _measure_surface(scene, looks, batch_size):
+    points = scene.points()
     power, coherence, beta, training, acceptance = [], [], [], [], []
     for look in looks:
         p, c, b, train, accept = [], [], [], [], []
@@ -293,7 +303,7 @@ def _measure(scene, looks, batch_size):
                 min(start + batch_size, len(scene.rays)),
                 device=scene.rays.device,
             )
-            response, count = look.response(scene, ids)
+            response, count = look.response(points[ids], ids)
             summed = response.sum((1, 2))
             p.append((summed.abs() / count.clamp_min(1)).square())
             c.append(summed.abs() / response.abs().sum((1, 2)).clamp_min(1e-20))
@@ -357,7 +367,7 @@ def _final_normals(scene, looks, points, args):
             else:
                 values = look_statistics(response, directions, torch)
             for key, value in values.items():
-                value = _array(value)
+                value = _to_numpy(value)
                 if key not in stats:
                     stats[key] = np.zeros(
                         (count, *value.shape[1:]),
@@ -379,7 +389,7 @@ def _final_normals(scene, looks, points, args):
         args.min_coherence,
         args.dynamic_range_db,
     )
-    index = np.arange(count).reshape(64, 511)
+    index = np.arange(count).reshape(points.shape[0], points.shape[1] - 1)
     inverse = np.concatenate((index, index[:, :1]), axis=1).ravel()
     field = pack_normal_image(estimated, inverse, points)
     return {
@@ -392,94 +402,25 @@ def _final_normals(scene, looks, points, args):
     }
 
 
-def reconstruct(args, trajectory):
-    """Finalize one RF-only scene; never load labels, images or LiDAR poses."""
-    started = time.monotonic()
-    frames = temporal_frames(
-        args.frame_num, trajectory.frame_count, args.temporal_window
-    )
-    if args.temporal_fusion == "coherent" and trajectory.platform_motion == "moving":
-        raise ValueError(
-            "Coherent normal fusion requires a static platform and stable inter-rotation phase"
-        )
-    record = trajectory.frame_metadata(args.frame_num)
-    if args.aperture > min(
-        trajectory.core_bounds(i)[1] - trajectory.core_bounds(i)[0] for i in frames
-    ):
-        raise ValueError("Aperture exceeds a contributing radar rotation")
-    image = partial(
-        motion_coarse_image,
-        range_oversample=args.coarse_oversample,
-        waveform=trajectory.waveform,
-    )
-    xp = backend(args.backend)
-    device = torch.device("cpu" if xp is np else "cuda")
-    stages = {}
-    stage_started = time.monotonic()
-    print("  Reading RF and preparing target geometry", flush=True)
-    frame, geometry, facing, origins, _ = trajectory.registered_frame(
-        args.frame_num, args.frame_num, args.aperture, args.geometry_json
-    )
-    stages["target_read_preprocess_seconds"] = time.monotonic() - stage_started
-    stage_started = time.monotonic()
-    coarse = image(frame, geometry, origins, facing, args.aperture, args.backend)
-    baseline = panoradar_peak_surface(
-        coarse, args.coarse_oversample, args.min_range, args.max_range
-    )
-    stages["target_coarse_image_seconds"] = time.monotonic() - stage_started
-    stage_started = time.monotonic()
-    print("  Selecting RF surface initialization", flush=True)
-    if xp is not np:
-        xp.get_default_memory_pool().free_all_blocks()
-    refinement_look = _Look(
-        trajectory, args.frame_num, args.frame_num, args, device, include_padding=True
-    )
-    refine = partial(
-        _refine_range_candidates,
-        args,
-        frame=frame,
-        geometry=geometry,
-        origins=origins,
-        facing=facing,
-        upper=min(
-            args.max_range,
-            C
-            / (2 * refinement_look.wave.bandwidth_hz)
-            * (refinement_look.wave.samples - 1 / args.oversample),
-        ),
-        sampler=refinement_look,
-        aperture_selector=refinement_look.select_aperture,
-    )
-    initial, fields, initialization = select_motion_surface(
-        args, trajectory, args.frame_num, frames, coarse, image, refine
-    )
-    stages["multiview_surface_initialization_seconds"] = (
-        time.monotonic() - stage_started
-    )
-    stage_started = time.monotonic()
-    del coarse, frame, refine, refinement_look
-    if xp is not np:
-        xp.get_default_memory_pool().free_all_blocks()
-    looks = [
-        _Look(trajectory, number, args.frame_num, args, device) for number in frames
-    ]
-    anchor_time = trajectory.timestamps[int(trajectory.separators[args.frame_num])]
-    scene = _Scene(initial, fields["surface_valid"], args, device)
-    for look in looks:
-        look.apertures(scene.points().detach(), args.aperture, args.batch_size)
-    stages["manifold_and_spectra_setup_seconds"] = time.monotonic() - stage_started
-    stage_started = time.monotonic()
-    initial_power, initial_coherence, _, training_power, acceptance_power = _measure(
-        scene, looks, args.batch_size
-    )
-    stages["initial_dense_matching_seconds"] = time.monotonic() - stage_started
-    noise = initial_power.median(dim=1).values.clamp_min(1e-20) * 0.01
-    supported = torch.nonzero(scene.supported, as_tuple=False).flatten()
-    if len(supported) < 16 or initial_power.max().item() <= 1e-20:
-        raise ValueError("Insufficient RF-supported surface for optimization")
+@dataclass(frozen=True)
+class _SurfaceOptimization:
+    initial_objective: float
+    best_objective: float
+    best_iteration: int
+    initial_state: dict[str, torch.Tensor]
+    history: list[dict[str, int | float]]
+
+
+def _optimize_surface(
+    scene, looks, supported, noise, training_power, acceptance_power, args
+):
+    device = scene.rays.device
+    initial_state = {
+        key: value.detach().clone() for key, value in scene.state_dict().items()
+    }
     random = np.random.default_rng(args.seed)
     validation = supported[
-        _tensor(
+        _to_tensor(
             random.choice(len(supported), min(2048, len(supported)), replace=False),
             device,
         )
@@ -501,7 +442,7 @@ def reconstruct(args, trajectory):
     initial_objective = value.item()
     best_value = initial_objective
     best_iteration = 0
-    best = {key: value.detach().clone() for key, value in scene.state_dict().items()}
+    best_state = initial_state
     history = [
         {
             "iteration": 0,
@@ -511,8 +452,6 @@ def reconstruct(args, trajectory):
         }
     ]
     optimizer = torch.optim.Adam(scene.parameters(), lr=args.learning_rate)
-    initialization_seconds = time.monotonic() - started
-    stage_started = time.monotonic()
     for step in range(args.iterations):
         optimizer.zero_grad()
         training_rf = torch.zeros((), dtype=torch.float64, device=device)
@@ -551,7 +490,7 @@ def reconstruct(args, trajectory):
             ):
                 best_value = value.item()
                 best_iteration = step + 1
-                best = {
+                best_state = {
                     key: value.detach().clone()
                     for key, value in scene.state_dict().items()
                 }
@@ -559,10 +498,129 @@ def reconstruct(args, trajectory):
                 f"  optimization {step + 1}/{args.iterations}: RF acceptance loss={rf.item():.5f}",
                 flush=True,
             )
-    scene.load_state_dict(best)
+    scene.load_state_dict(best_state)
+    return _SurfaceOptimization(
+        initial_objective=initial_objective,
+        best_objective=best_value,
+        best_iteration=best_iteration,
+        initial_state=initial_state,
+        history=history,
+    )
+
+
+def _initialize_surface(args, trajectory, frames, image, device, xp, stages):
+    stage_started = time.monotonic()
+    print("  Reading RF and preparing target geometry", flush=True)
+    registered = trajectory.registered_frame(
+        args.frame_num, args.frame_num, args.aperture, args.geometry_json
+    )
+    frame, geometry, facing, origins, _ = registered
+    stages["target_read_preprocess_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    coarse = image(frame, geometry, origins, facing, args.aperture, args.backend)
+    baseline = panoradar_peak_surface(
+        coarse, args.coarse_oversample, args.min_range, args.max_range
+    )
+    stages["target_coarse_image_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    print("  Selecting RF surface initialization", flush=True)
+    if xp is not np:
+        xp.get_default_memory_pool().free_all_blocks()
+    refinement_look = _RegisteredRadarLook(
+        trajectory, args.frame_num, registered, args, device, xp, include_padding=True
+    )
+    refine = partial(
+        _refine_range_candidates,
+        args,
+        frame=frame,
+        geometry=geometry,
+        origins=origins,
+        facing=facing,
+        upper=min(
+            args.max_range,
+            C
+            / (2 * refinement_look.wave.bandwidth_hz)
+            * (refinement_look.wave.samples - 1 / args.oversample),
+        ),
+        sampler=refinement_look,
+        aperture_selector=refinement_look.select_aperture,
+    )
+    initial, fields, initialization = select_motion_surface(
+        args, trajectory, args.frame_num, frames, coarse, image, refine
+    )
+    stages["multiview_surface_initialization_seconds"] = (
+        time.monotonic() - stage_started
+    )
+    return baseline, initial, fields, initialization
+
+
+def reconstruct(args, trajectory):
+    """Finalize one RF-only scene; never load labels, images or LiDAR poses."""
+    started = time.monotonic()
+    frames = temporal_frames(
+        args.frame_num, trajectory.frame_count, args.temporal_window
+    )
+    if args.temporal_fusion == "coherent" and trajectory.platform_motion == "moving":
+        raise ValueError(
+            "Coherent normal fusion requires a static platform and stable inter-rotation phase"
+        )
+    record = trajectory.frame_metadata(args.frame_num)
+    if args.aperture > min(
+        trajectory.core_bounds(i)[1] - trajectory.core_bounds(i)[0] for i in frames
+    ):
+        raise ValueError("Aperture exceeds a contributing radar rotation")
+    image = partial(
+        motion_coarse_image,
+        range_oversample=args.coarse_oversample,
+        waveform=trajectory.waveform,
+        azimuth_columns=1024 if trajectory.dataset_type == "SelfData" else 512,
+    )
+    xp = backend(args.backend)
+    device = torch.device("cpu" if xp is np else "cuda")
+    stages = {}
+    baseline, initial, fields, initialization = _initialize_surface(
+        args, trajectory, frames, image, device, xp, stages
+    )
+    stage_started = time.monotonic()
+    if xp is not np:
+        xp.get_default_memory_pool().free_all_blocks()
+    looks = []
+    for number in frames:
+        registered = trajectory.registered_frame(
+            number, args.frame_num, args.aperture, args.geometry_json
+        )
+        looks.append(
+            _RegisteredRadarLook(trajectory, number, registered, args, device, xp)
+        )
+    del registered
+    anchor_time = trajectory.timestamps[int(trajectory.separators[args.frame_num])]
+    scene = _RadialSurface(
+        initial, fields["surface_valid"], fields["range_upper_m"], args, device
+    )
+    with torch.no_grad():
+        initial_points = scene.points()
+    for look in looks:
+        look.prepare_apertures(initial_points, args.aperture, args.batch_size)
+    stages["manifold_and_spectra_setup_seconds"] = time.monotonic() - stage_started
+    stage_started = time.monotonic()
+    initial_power, initial_coherence, _, training_power, acceptance_power = (
+        _measure_surface(scene, looks, args.batch_size)
+    )
+    stages["initial_dense_matching_seconds"] = time.monotonic() - stage_started
+    noise = initial_power.median(dim=1).values.clamp_min(1e-20) * 0.01
+    supported = torch.nonzero(scene.supported, as_tuple=False).flatten()
+    if len(supported) < 16 or initial_power.max().item() <= 1e-20:
+        raise ValueError("Insufficient RF-supported surface for optimization")
+    initialization_seconds = time.monotonic() - started
+    stage_started = time.monotonic()
+    optimization = _optimize_surface(
+        scene, looks, supported, noise, training_power, acceptance_power, args
+    )
     stages["optimization_seconds"] = time.monotonic() - stage_started
     stage_started = time.monotonic()
-    power, coherence, reflectivity, _, _ = _measure(scene, looks, args.batch_size)
+    power, coherence, reflectivity, _, _ = _measure_surface(
+        scene, looks, args.batch_size
+    )
     dense_gain = (
         torch.log(
             (power[:, supported] + noise[:, None])
@@ -571,15 +629,18 @@ def reconstruct(args, trajectory):
         .mean()
         .item()
     )
-    accepted = best_value < initial_objective and dense_gain >= 0
+    accepted = (
+        optimization.best_objective < optimization.initial_objective and dense_gain >= 0
+    )
     if not accepted:
-        scene.load_state_dict(
-            {key: torch.zeros_like(value) for key, value in best.items()}
+        scene.load_state_dict(optimization.initial_state)
+        power, coherence, reflectivity, _, _ = _measure_surface(
+            scene, looks, args.batch_size
         )
-        power, coherence, reflectivity, _, _ = _measure(scene, looks, args.batch_size)
     stages["final_dense_matching_seconds"] = time.monotonic() - stage_started
-    selected_passes = best_iteration if accepted else 0
-    points = _array(scene.points()).reshape(64, 511, 3)
+    selected_passes = optimization.best_iteration if accepted else 0
+    surface_shape = initial[:, :-1].shape[:2]
+    points = _to_numpy(scene.points()).reshape(*surface_shape, 3)
 
     def panorama(value):
         return np.concatenate((value, value[:, :1]), axis=1)
@@ -606,25 +667,26 @@ def reconstruct(args, trajectory):
         "initial_range_m": np.linalg.norm(initial, axis=-1).astype(np.float32),
         "surface_valid": fields["surface_valid"],
         "rf_update_count": panorama(
-            _array(scene.supported).reshape(64, 511).astype(np.int32) * selected_passes
+            _to_numpy(scene.supported).reshape(surface_shape).astype(np.int32)
+            * selected_passes
         ),
-        "patch_ids": panorama(_array(scene.labels).reshape(64, 511)),
-        "geometric_patch_normals": _array(plane_normals),
-        "geometric_patch_offsets_m": _array(plane_offsets),
+        "patch_ids": panorama(_to_numpy(scene.labels).reshape(surface_shape)),
+        "geometric_patch_normals": _to_numpy(plane_normals),
+        "geometric_patch_offsets_m": _to_numpy(plane_offsets),
         "initial_reflection": panorama(
-            _array(initial_power.mean(0).sqrt()).reshape(64, 511)
+            _to_numpy(initial_power.mean(0).sqrt()).reshape(surface_shape)
         ).astype(np.float32),
-        "reflection": panorama(_array(power.mean(0).sqrt()).reshape(64, 511)).astype(
-            np.float32
-        ),
+        "reflection": panorama(
+            _to_numpy(power.mean(0).sqrt()).reshape(surface_shape)
+        ).astype(np.float32),
         "initial_coherence": panorama(
-            _array(initial_coherence.mean(0)).reshape(64, 511)
+            _to_numpy(initial_coherence.mean(0)).reshape(surface_shape)
         ).astype(np.float32),
-        "coherence": panorama(_array(coherence.mean(0)).reshape(64, 511)).astype(
-            np.float32
-        ),
+        "coherence": panorama(
+            _to_numpy(coherence.mean(0)).reshape(surface_shape)
+        ).astype(np.float32),
         "complex_reflectivity": np.stack(
-            [panorama(x.reshape(64, 511)) for x in _array(reflectivity)]
+            [panorama(x.reshape(surface_shape)) for x in _to_numpy(reflectivity)]
         ),
         "pose_timestamps_s": times,
         "world_from_platform": poses,
@@ -672,8 +734,8 @@ def reconstruct(args, trajectory):
             "finalized_covered_fraction": 1.0 if selected_passes else 0.0,
             "acceptance_uses_lidar": False,
         },
-        rf_acceptance_objective_initial=initial_objective,
-        rf_acceptance_objective_best=best_value,
+        rf_acceptance_objective_initial=optimization.initial_objective,
+        rf_acceptance_objective_best=optimization.best_objective,
         dense_log_power_gain_before_acceptance=dense_gain,
         initialization_seconds=initialization_seconds,
         prediction_seconds=time.monotonic() - started,
@@ -701,7 +763,7 @@ def reconstruct(args, trajectory):
                 .item()
             ),
         },
-        optimization_history=history,
+        optimization_history=optimization.history,
         limitations=[
             "Local single-surface radial charts initialized from RF peaks; no guarantee of global optimum or recovery outside those branches",
             "Effective PanoRadar array unless calibrated Tx/Rx geometry is supplied; nominal motor angles remain fixed",

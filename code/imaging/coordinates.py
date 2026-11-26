@@ -7,12 +7,18 @@ import numpy as np
 TRAINING_XYZ_TO_RADAR = np.array([1.0, -1.0, -1.0])
 
 
-@lru_cache(maxsize=1)
-def normal_coordinate_frames():
+def panoramic_angles(azimuth_columns):
+    """Return azimuth and elevation grid axes in radians."""
+    azimuth = np.linspace(0, -2 * np.pi, azimuth_columns)[None, :]
+    elevation = np.linspace(np.pi / 4, -np.pi / 4, 64)[:, None]
+    return azimuth, elevation
+
+
+@lru_cache(maxsize=2)
+def normal_coordinate_frames(azimuth_columns=512):
     """Return the training RHS-to-XYZ basis and its inverse at each pixel."""
-    theta = np.linspace(0, -2 * np.pi, 512)[None, :]
-    phi = np.linspace(np.pi / 4, -np.pi / 4, 64)[:, None]
-    azimuth = np.zeros((1, 512, 3, 3))
+    theta, phi = panoramic_angles(azimuth_columns)
+    azimuth = np.zeros((1, azimuth_columns, 3, 3))
     azimuth[..., 0, 0] = azimuth[..., 1, 1] = np.cos(theta)
     azimuth[..., 1, 0] = -np.sin(theta)
     azimuth[..., 0, 1] = np.sin(theta)
@@ -31,12 +37,12 @@ def normal_coordinate_frames():
 
 def normal_to_rhs(normal):
     """Convert XYZ normals into the fixed panoramic basis, without masking."""
-    return (normal_coordinate_frames()[1] @ normal[..., None])[..., 0]
+    return (normal_coordinate_frames(normal.shape[-2])[1] @ normal[..., None])[..., 0]
 
 
 def rhs_to_normal(rhs):
     """Convert RHS labels to XYZ, retaining the invalid-label sentinel."""
-    normal = (normal_coordinate_frames()[0] @ rhs[..., None])[..., 0]
+    normal = (normal_coordinate_frames(rhs.shape[-2])[0] @ rhs[..., None])[..., 0]
     normal[np.all(rhs < -10, axis=-1)] = -1e3
     return normal
 

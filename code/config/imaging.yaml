@@ -11,7 +11,7 @@ coarse_oversample: 4
 oversample: 16
 iterations: 80  # Full RF-supported surface passes / Adam updates.
 batch_size: 256  # Memory limit; gradients are accumulated across all batches.
-patch_shape: [4, 8]
+patch_shape: [3, 6]
 range_bound_m: 0.075
 
 # 回波法线在最终表面与同一逐 chirp 轨迹上计算，不从距离图求梯度。

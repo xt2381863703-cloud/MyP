@@ -14,7 +14,7 @@ def reference_method(args):
     )
 
 
-def create_reference(args):
+def create_reference(args, *, azimuth_columns=512):
     raw_folder = Path(args.in_traj_folder)
     if getattr(args, "dataset_type", "PanoData") == "SelfData":
         from .self_lidar import SelfLidarReference
@@ -23,7 +23,11 @@ def create_reference(args):
             key: getattr(args, key, value) for key, value in EVALUATION_DEFAULTS.items()
         }
         return SelfLidarReference(
-            raw_folder, args.min_range, args.max_range, **settings
+            raw_folder,
+            args.min_range,
+            args.max_range,
+            azimuth_columns=azimuth_columns,
+            **settings,
         )
     from .lidar import TrainingLidarReference
 

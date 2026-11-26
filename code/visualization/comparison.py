@@ -204,7 +204,7 @@ def plot_normals(
             ),
             (
                 unmasked["training_normal_xyz"],
-                unmasked["valid"].reshape(64, 512),
+                unmasked["valid"].reshape(current.shape[:2]),
                 "激光法线：保留玻璃区域的全部有效测量",
             ),
         ]
@@ -268,9 +268,9 @@ def plot_geometry(prediction, reference, evaluation, errors, metadata, args, out
             f"第 {args.frame_num} 圈｜俯仰结构与俯视点云对比（参照论文图8）\n左列为三维点云，右列为同一套点云在零高度附近的俯视图：|高度|≤{tolerance:g}米\n射频保留所有表面候选，不按置信度或激光误差删点；高度带不是精确平面截面\n全景图显示俯仰 {_elevation_limits(args)} 度；统计与累计分布使用完整评价区域\n{ERROR_COLOR_NOTE}",
             fontsize=13,
         )
-        unique = np.ones((64, 512), dtype=bool)
+        unique = np.ones(prediction["predicted_range_m"].shape, dtype=bool)
         unique[:, -1] = False
-        truth = reference["points_m"].reshape(64, 512, 3)
+        truth = reference["points_m"].reshape(*unique.shape, 3)
         clouds = [
             (prediction["panoradar_points_m"][unique], "PanoRadar 原方法距离峰值点云"),
             (prediction["points_m"][unique], "当前方法统一表面点云"),

@@ -19,7 +19,7 @@ def panoradar_peak_surface(coarse, oversample, min_range, max_range):
     depth[:, -1], reflection[:, -1] = depth[:, 0], reflection[:, 0]
     return {
         "panoradar_range_m": depth,
-        "panoradar_points_m": (radar_pixel_rays() * depth[..., None]).astype(
+        "panoradar_points_m": (radar_pixel_rays(depth.shape[1]) * depth[..., None]).astype(
             np.float32
         ),
         "panoradar_reflection": reflection,
@@ -36,6 +36,7 @@ def motion_coarse_image(
     compute_backend,
     range_oversample=1,
     waveform=None,
+    azimuth_columns=512,
 ):
     """Far-field beamforming with actual moving antenna positions.
 
@@ -51,7 +52,7 @@ def motion_coarse_image(
     signal = xp.asarray(frame)
     positions = xp.asarray(geometry.phase_centers_m)
     freq = xp.asarray(wave.frequencies_hz)
-    rays = radar_pixel_rays()
+    rays = radar_pixel_rays(azimuth_columns)
     # Far-field selection depends only on azimuth; use a distant point to
     # suppress finite-range parallax in this coarse proposal stage.
     ids, mask = motion_aperture_indices(rays[32] * 1e6, origins, facing, aperture)
@@ -65,14 +66,14 @@ def motion_coarse_image(
     taper = (0.5 * (1 + np.cos(np.pi * delta / span))) * mask
     windows = xp.asarray(taper[..., None])
     fast = xp.asarray(np.hanning(wave.samples))
-    result = np.empty((nfft, 64, 512), np.float32)
+    result = np.empty((nfft, *rays.shape[:2]), np.float32)
     # Planar yaw/translation permits the same separable vertical beamforming as
     # the original code. General SE(3) poses retain all per-channel positions.
     relative = geometry.phase_centers_m - geometry.phase_centers_m[:, :1]
     separable = np.allclose(relative, relative[:1], atol=1e-10) and np.allclose(
         relative[..., :2], 0, atol=1e-10
     )
-    for elevation in range(64):
+    for elevation in range(rays.shape[0]):
         if separable:
             phase = (
                 4j
@@ -83,7 +84,7 @@ def motion_coarse_image(
                 * freq
             )
             vertical = (signal * xp.exp(phase)[None]).mean(axis=1)
-        for start in range(0, 512, 16):
+        for start in range(0, azimuth_columns, 16):
             selected = xp.asarray(ids[start : start + 16])
             look = xp.asarray(rays[elevation, start : start + 16])
             if separable:
@@ -142,7 +143,8 @@ def _refine_range_candidates(
     depths = candidates["range_m"][:, :-1].copy()
     valid = candidates["valid"][:, :-1]
     pixels, peaks = np.nonzero(valid.reshape(-1, valid.shape[-1]))
-    rays = radar_pixel_rays()[:, :-1].reshape(-1, 3)[pixels]
+    azimuth_columns = candidates["range_m"].shape[1]
+    rays = radar_pixel_rays(azimuth_columns)[:, :-1].reshape(-1, 3)[pixels]
     centers = depths.reshape(-1, depths.shape[-1])[pixels, peaks].astype(float)
     amplitude = np.zeros_like(depths, dtype=float).reshape(-1, depths.shape[-1])
     offsets = np.linspace(

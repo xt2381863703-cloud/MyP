@@ -4,7 +4,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-IMAGE_SHAPE = (64, 512)
 SCORE_KEYS = ("sn_angle_mean", "sn_angle_median", "sn_angle_80", "sn_angle_90")
 
 
@@ -13,8 +12,12 @@ def evaluate_normal_image(
 ):
     """The exact mask, cosine and quantiles in SnEvaluator.process."""
     pred_rhs = np.asarray(pred_rhs, dtype=np.float32)
-    if pred_rhs.shape != (3, 64, 512):
-        raise ValueError("Prediction must have shape (3,64,512)")
+    if (
+        pred_rhs.ndim != 3
+        or pred_rhs.shape[:2] != (3, 64)
+        or pred_rhs.shape != reference["training_rhs"].shape
+    ):
+        raise ValueError("Prediction must match the reference (3,64,azimuth) grid")
     finite = np.isfinite(pred_rhs).all(axis=0)
     pred_rhs = np.where(finite[None], pred_rhs, 0)
     pred = torch.tensor(pred_rhs.tolist(), dtype=torch.float32)
@@ -26,7 +29,7 @@ def evaluate_normal_image(
     cosine = F.cosine_similarity(pred, target, dim=0, eps=1e-4).clamp(-1.0, 1.0)
     angles = torch.rad2deg(torch.acos(cosine[mask]))
     mask_np = np.asarray(mask.tolist(), dtype=bool)
-    error = np.full(IMAGE_SHAPE, np.nan, np.float32)
+    error = np.full(mask_np.shape, np.nan, np.float32)
     error[mask_np] = np.asarray(angles.tolist(), dtype=np.float32)
     predicted = finite & (np.linalg.norm(pred_rhs, axis=0) > 1e-12)
     if defined is not None:

@@ -21,7 +21,7 @@ def compare(prediction, reference, args, *, pose_refinement_enabled=True):
     if "range_evaluation_mask" in reference:
         mask &= reference["range_evaluation_mask"]
     mask[:, -1] = False
-    truth_points = reference["points_m"].reshape(64, 512, 3)
+    truth_points = reference["points_m"].reshape(*depth.shape, 3)
     position_mask = mask & np.isfinite(truth_points).all(axis=-1)
     arrays = {"range_mask": mask, "position_mask": position_mask}
     trajectory = "corrected trajectory" if pose_refinement_enabled else "input trajectory"
@@ -41,9 +41,9 @@ def compare(prediction, reference, args, *, pose_refinement_enabled=True):
         ("panoradar", "panoradar_range_m", "panoradar_points_m"),
         ("current", "predicted_range_m", "points_m"),
     ):
-        range_error = np.full((64, 512), np.nan, dtype=np.float32)
+        range_error = np.full(depth.shape, np.nan, dtype=np.float32)
         range_error[mask] = np.abs(prediction[range_key][mask] - depth[mask])
-        point_error = np.full((64, 512), np.nan, dtype=np.float32)
+        point_error = np.full(depth.shape, np.nan, dtype=np.float32)
         point_error[position_mask] = np.linalg.norm(
             prediction[point_key][position_mask] - truth_points[position_mask], axis=-1
         )

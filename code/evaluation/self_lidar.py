@@ -10,10 +10,13 @@ from ..imaging.coordinates import TRAINING_XYZ_TO_RADAR, normal_to_rhs
 
 
 class SelfLidarReference:
-    def __init__(self, raw_folder, min_range, max_range, **settings):
+    def __init__(self, raw_folder, min_range, max_range, *, azimuth_columns=512, **settings):
         validate_evaluation_settings(settings)
+        if type(azimuth_columns) is not int or azimuth_columns not in (512, 1024):
+            raise ValueError("SelfData expects 512 or 1024 panorama columns")
         self.folder = Path(raw_folder)
         self.minimum, self.maximum = min_range, max_range
+        self.azimuth_columns = azimuth_columns
         self.settings = settings
         with np.load(self.folder / "data_params.npz", allow_pickle=False) as data:
             self.separators = data["lidar_sep"].copy()
@@ -105,21 +108,22 @@ class SelfLidarReference:
         if not allowed.any():
             raise ValueError("No SelfData LiDAR points in the evaluation range/FoV")
         selected = np.flatnonzero(allowed)
+        unique_columns = self.azimuth_columns - 1
         row = np.rint((np.pi / 4 - elevation[selected]) * 63 / (np.pi / 2)).astype(int)
         column = (
             np.rint(
                 np.mod(-np.arctan2(points[selected, 1], points[selected, 0]), 2 * np.pi)
-                * 511
+                * unique_columns
                 / (2 * np.pi)
             ).astype(int)
-            % 511
+            % unique_columns
         )
-        cell = row * 511 + column
+        cell = row * unique_columns + column
         order = np.lexsort((ranges[selected], cell))
         _, first = np.unique(cell[order], return_index=True)
         chosen = selected[order[first]]
         cells = cell[order[first]]
-        count = 64 * 511
+        count = 64 * unique_columns
         position = np.full((count, 3), np.nan)
         depth = np.full(count, np.nan)
         normal = np.full((count, 3), np.nan)
@@ -150,7 +154,7 @@ class SelfLidarReference:
         normal[cells[defined]] = normals[defined]
 
         def panorama(value):
-            value = value.reshape(64, 511, *value.shape[1:])
+            value = value.reshape(64, unique_columns, *value.shape[1:])
             return np.concatenate((value, value[:, :1]), axis=1)
 
         position, depth, normal = map(panorama, (position, depth, normal))
@@ -170,7 +174,7 @@ class SelfLidarReference:
             "defined": normal_mask.ravel(),
             "valid": normal_mask.ravel(),
             "position_valid": range_mask.ravel(),
-            "pixel_row_col": np.stack(np.indices((64, 512)), axis=-1).reshape(-1, 2),
+            "pixel_row_col": np.stack(np.indices(depth.shape), axis=-1).reshape(-1, 2),
             "range_image_m": depth.astype(np.float32),
             "training_rhs": rhs.transpose(2, 0, 1),
             "training_depth": np.where(range_mask, depth / 10, -1e3)[None].astype(
@@ -189,7 +193,7 @@ class SelfLidarReference:
             normal_max_neighbors=neighbors,
             normal_min_neighbors=self.settings["lidar_normal_min_neighbors"],
             normal_method="local LiDAR PCA, outward orientation; no planarity/curvature selection",
-            projection="nearest measured range in each 64x511 angular cell; duplicated endpoint excluded from scoring; no interpolation or hole filling",
+            projection=f"nearest measured range in each 64x{unique_columns} angular cell; duplicated endpoint excluded from scoring; no interpolation or hole filling",
         )
         return reference, metadata
 
